@@ -91,7 +91,31 @@ services:
       TESSERA_UPSTREAM_URL: http://agentgateway:8080
       TESSERA_SIGNING_KEY: mesh-signing-key-replace-in-production
       SPIFFE_ENDPOINT_SOCKET: unix:///tmp/spire-agent/api.sock
+      # LLM guardrail (optional): set these to enable semantic
+      # classification on ambiguous FREE_TEXT tool outputs.
+      # Without these, only deterministic scanners run (zero LLM cost).
+      # TESSERA_GUARDRAIL_PROVIDER: anthropic
+      # TESSERA_GUARDRAIL_MODEL: claude-haiku-4-5-20251001
+      # ANTHROPIC_API_KEY: your-key-here
     restart: unless-stopped
+
+  # ── LLM Guardrail Service (optional) ────────────────────────
+  # Uncomment this block to add a centralized LLM guardrail that
+  # classifies ambiguous tool outputs. The Tessera proxy calls this
+  # service only when deterministic scanners are uncertain.
+  #
+  # guardrail-service:
+  #   build:
+  #     context: ../..
+  #     dockerfile: deployment/docker/Dockerfile.guardrail
+  #   hostname: guardrail
+  #   ports:
+  #     - "9091:9091"
+  #   environment:
+  #     ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+  #     GUARDRAIL_MODEL: claude-haiku-4-5-20251001
+  #     GUARDRAIL_CONFIDENCE: 0.7
+  #   restart: unless-stopped
 
   # ── Observability ───────────────────────────────────────────
   otel-collector:

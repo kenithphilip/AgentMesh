@@ -92,13 +92,42 @@ def main() -> None:
         print(f"    Reason: {decision.reason}")
         print(f"    Context min_trust: {ctx.min_trust}")
 
+    # Step 4: Show LLM guardrail (if configured)
+    print()
+    print("[4] LLM guardrail classification...")
+    try:
+        import os
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if api_key:
+            import anthropic
+            from tessera.guardrail import LLMGuardrail
+
+            guardrail = LLMGuardrail(
+                client=anthropic.Anthropic(),
+                model=os.environ.get("GUARDRAIL_MODEL", "claude-haiku-4-5-20251001"),
+            )
+            decision_g = guardrail.evaluate(content, "read_webpage")
+            print(f"    Classification: {decision_g.category}")
+            print(f"    Is injection: {decision_g.is_injection}")
+            print(f"    Confidence: {decision_g.confidence:.2f}")
+            print(f"    Status: guardrail confirms the injection")
+        else:
+            print("    Skipped (set ANTHROPIC_API_KEY to enable)")
+            print("    The deterministic scanners caught this one anyway.")
+    except ImportError:
+        print("    Skipped (pip install tessera-mesh[guardrail] to enable)")
+
     print()
     print("=" * 60)
-    print("The injection in the webpage was detected and the email")
-    print("was blocked. The attacker's payload tried to redirect")
-    print("booking details to admin@travel-reviews-verification.com")
-    print("but Tessera's taint tracking prevented the send_email")
-    print("tool from executing in a tainted context.")
+    print("RESULT: The injection in the webpage was detected and the")
+    print("email was blocked. The attacker tried to redirect booking")
+    print("details to a phishing address, but Tessera's taint tracking")
+    print("prevented the send_email tool from executing.")
+    print()
+    print("Three layers of defense:")
+    print("  Layer 1: Heuristic scanner detected override language")
+    print("  Layer 2: LLM guardrail confirmed (if enabled)")
+    print("  Layer 3: Taint floor blocked send_email (architectural)")
     print("=" * 60)
 
 

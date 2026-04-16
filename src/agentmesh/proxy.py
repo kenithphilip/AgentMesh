@@ -1,28 +1,34 @@
 """AgentMesh MCP proxy: production security mesh for tool calls.
 
-Integrates Tessera's full defense stack into a single proxy service:
+Integrates Tessera's full defense stack into a single proxy service.
 
-1. SPIRE identity verification (JWT-SVID on every request)
-2. Delegation chain verification (scoped token checking)
-3. Per-session rate limiting with burst detection
-4. MCP server allowlist with rug-pull detection
-5. Content scanning (heuristic, directive, schema, binary, LLM guardrail)
-6. Policy evaluation (taint tracking + attribute-based)
-7. Compliance events with NIST/CWE enrichment
-8. Human approval gates for high-risk tool calls
+Tier 1 (core):
+ 1. SPIRE identity verification (JWT-SVID on every request)
+ 2. Delegation chain verification (scoped token checking)
+ 3. Per-session rate limiting with burst detection
+ 4. MCP server allowlist with rug-pull detection
+ 5. Content scanning (heuristic, directive, schema, LLM guardrail)
+ 6. Policy evaluation (taint tracking + attribute-based)
+ 7. Compliance events with NIST/CWE enrichment
+ 8. Human approval gates for high-risk tool calls
+ 9. Read-only argument validation (path traversal, mutation guard)
 
-Architecture:
+Tier 2 (production hardening):
+10. Value-level taint (DependencyAccumulator per-argument provenance)
+11. Content inspector for binary content (PDFs, images, audio)
+12. Prompt screening before context entry (delegated injection defense)
+13. Secret redaction in tool outputs
+14. PII scanning (optional, requires presidio)
 
-    Agent (MCP client) --> AgentMesh Proxy --> upstream MCP server
-                               |
-                        Identity verification (SPIRE)
-                        Delegation token check
-                        Rate limiting
-                        MCP allowlist
-                        Content scanners
-                        Policy evaluation
-                        Compliance audit
-                        Human approval (optional)
+Tier 3 (defense-in-depth):
+15. Trust decay (time-based + anomaly-driven trust degradation)
+16. Risk forecasting (salami detection, drift, commitment creep)
+17. Plan verification (tool sequence vs user intent)
+18. Side-channel mitigations (loop guard, structured results)
+19. Canary tokens (output manipulation confirmation)
+20. Output provenance verification (n-gram echo, task relevance)
+21. CEL deny rules (expression-based policy extension)
+22. xDS policy distribution (REST snapshot endpoint)
 
 Usage::
 
@@ -100,6 +106,27 @@ class MeshProxy:
     rate_limit_calls: int = 50
     rate_limit_burst: int = 10
 
+    # Tier 2: production hardening
+    enable_prompt_screening: bool = True
+    enable_secret_redaction: bool = True
+    enable_pii_scanning: bool = False       # requires presidio
+
+    # Tier 3: defense-in-depth
+    enable_trust_decay: bool = False
+    enable_risk_forecasting: bool = True
+    enable_plan_verification: bool = True
+    enable_canary_tokens: bool = False
+    cel_rules_path: str | None = None
+
+    # Tier A+B: identity, transport, exports
+    trust_domain: str = "agentmesh.local"
+    spire_socket: str | None = None
+    approval_webhook_url: str | None = None
+    enable_rag_guard: bool = False
+    enable_sarif: bool = True
+    enable_telemetry: bool = False
+    enable_xds_server: bool = False
+
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
     _context: Context = field(default_factory=Context, init=False, repr=False)
@@ -108,6 +135,20 @@ class MeshProxy:
     _mcp_allowlist: Any = field(default=None, init=False, repr=False)
     _audit_log: Any = field(default=None, init=False, repr=False)
     _definition_tracker: Any = field(default=None, init=False, repr=False)
+    _accumulator: Any = field(default=None, init=False, repr=False)
+    _risk_forecaster: Any = field(default=None, init=False, repr=False)
+    _canary_tracker: Any = field(default=None, init=False, repr=False)
+    _secret_registry: Any = field(default=None, init=False, repr=False)
+    _trust_decay_policy: Any = field(default=None, init=False, repr=False)
+    _loop_guard: Any = field(default=None, init=False, repr=False)
+    _pii_scanner: Any = field(default=None, init=False, repr=False)
+    _identity: Any = field(default=None, init=False, repr=False)
+    _transport: Any = field(default=None, init=False, repr=False)
+    _exports: Any = field(default=None, init=False, repr=False)
+    _invariant_checker: Any = field(default=None, init=False, repr=False)
+    _session_store: Any = field(default=None, init=False, repr=False)
+    _evidence_buffer: Any = field(default=None, init=False, repr=False)
+    _cooldown: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -163,6 +204,103 @@ class MeshProxy:
         from tessera.mcp_allowlist import ToolDefinitionTracker
         self._definition_tracker = ToolDefinitionTracker()
 
+        # 7. Value-level taint (DependencyAccumulator)
+        from tessera.taint import DependencyAccumulator
+        self._accumulator = DependencyAccumulator(context=self._context)
+
+        # 8. Secret registry for redaction
+        if self.enable_secret_redaction:
+            from tessera.redaction import SecretRegistry
+            self._secret_registry = SecretRegistry()
+
+        # 9. Risk forecaster (salami detection, drift, commitment creep)
+        if self.enable_risk_forecasting:
+            from tessera.risk.forecaster import SessionRiskForecaster
+            self._risk_forecaster = SessionRiskForecaster()
+
+        # 10. Canary tracker
+        if self.enable_canary_tokens:
+            from tessera.scanners.canary import SegmentCanaryTracker
+            self._canary_tracker = SegmentCanaryTracker()
+
+        # 11. PII scanner
+        if self.enable_pii_scanning:
+            from tessera.scanners.pii import PIIScanner
+            self._pii_scanner = PIIScanner()
+
+        # 12. Trust decay
+        if self.enable_trust_decay:
+            from tessera.trust_decay import TrustDecayPolicy
+            self._trust_decay_policy = TrustDecayPolicy()
+
+        # 12. Side-channel mitigation: loop guard
+        from tessera.side_channels import LoopGuard
+        self._loop_guard = LoopGuard(max_iterations=200)
+
+        # 13. CEL deny rules (loaded through policy IR if cel_rules_path set)
+        if self.cel_rules_path and os.path.exists(self.cel_rules_path):
+            try:
+                from tessera.cel_engine import CELPolicyEngine, CELRule
+                import yaml
+                with open(self.cel_rules_path) as f:
+                    cel_data = yaml.safe_load(f) or {}
+                rules = [
+                    CELRule(name=r.get("name", f"rule_{i}"), expression=r["expression"])
+                    for i, r in enumerate(cel_data.get("rules", []))
+                ]
+                if rules:
+                    self._policy.cel_engine = CELPolicyEngine(rules)
+            except (ImportError, Exception):
+                pass
+
+        # -- Tier A+B helpers --
+
+        # 14. Identity provider (signing, SPIRE, mTLS, liveness)
+        from agentmesh.identity import IdentityProvider
+        self._identity = IdentityProvider(
+            signing_key=self.signing_key,
+            principal=self.principal,
+            trust_domain=self.trust_domain,
+            spire_socket=self.spire_socket,
+        )
+
+        # 15. MCP transport (baseline drift, RAG guard)
+        if self.enable_rag_guard:
+            from agentmesh.transport import MCPTransport
+            self._transport = MCPTransport(
+                upstream_url=self.upstream_url,
+                principal=self.principal,
+                signing_key=self.signing_key,
+            )
+
+        # 16. Compliance exports (SARIF, telemetry, xDS, confidence)
+        from agentmesh.exports import ComplianceExporter
+        self._exports = ComplianceExporter(
+            signing_key=self.signing_key,
+            principal=self.principal,
+            enable_sarif=self.enable_sarif,
+            enable_telemetry=self.enable_telemetry,
+            enable_xds_server=self.enable_xds_server,
+        )
+
+        # 17. Policy invariant checker (control-flow enforcement)
+        from tessera.policy_invariant import PolicyInvariantChecker
+        self._invariant_checker = PolicyInvariantChecker()
+
+        # 18. Session store for structured approval workflows
+        from tessera.sessions import SessionStore
+        self._session_store = SessionStore(encryption_key=self.signing_key[:32] if len(self.signing_key) >= 32 else None)
+
+        # 19. Evidence buffer for forensic bundles
+        from tessera.events import register_sink
+        from tessera.evidence import EvidenceBuffer
+        self._evidence_buffer = EvidenceBuffer()
+        register_sink(self._evidence_buffer)
+
+        # 20. Cooldown escalator (adaptive denial response)
+        from tessera.risk.cooldown import CooldownEscalator
+        self._cooldown = CooldownEscalator()
+
     # ------------------------------------------------------------------
     # Core evaluation pipeline
     # ------------------------------------------------------------------
@@ -187,9 +325,14 @@ class MeshProxy:
 
         Returns (allowed, reason).
         """
-        # 1. Identity verification
+        # 0. Policy invariant: mark that we received output
+        self._invariant_checker.on_output_received(session_id)
+
+        # 1. Identity verification (with SPIRE/JWT when available)
         if self.require_identity and not agent_identity:
             return False, "identity required: no agent_identity provided"
+        if agent_identity and self._identity is not None:
+            self._identity.heartbeat(agent_identity)
 
         # 2. Rate limiting
         allowed, reason = self._rate_limiter.check(session_id, tool_name)
@@ -209,9 +352,16 @@ class MeshProxy:
             except Exception as e:
                 return False, f"delegation: {str(e)[:100]}"
 
-        # 4. Policy evaluation (taint tracking)
+        # 4. Policy evaluation (taint tracking, with optional trust decay)
+        eval_context = self._context
+        if self._trust_decay_policy is not None:
+            from tessera.trust_decay import DecayAwareContext
+            eval_context = DecayAwareContext(
+                self._context, policy=self._trust_decay_policy,
+            )
+
         decision = self._policy.evaluate(
-            self._context, tool_name, args=args,
+            eval_context, tool_name, args=args,
             delegation=delegation,
             expected_delegate=agent_identity,
         )
@@ -234,8 +384,14 @@ class MeshProxy:
             emit(event)
             return False, decision.reason or "policy denied"
 
-        # 6. Human approval check
+        # 5b. Policy invariant: mark evaluation happened
+        self._invariant_checker.on_policy_evaluated(session_id)
+
+        # 6. Human approval check (with session store and cooldown)
         if tool_name in self._policy._human_approval_tools:
+            escalation = self._cooldown.state()
+            if escalation.level >= 2:
+                return False, "cooldown: escalation level 2, all side-effecting tools blocked"
             return False, f"human approval required for tool {tool_name!r}"
 
         # 7. Read-only argument validation
@@ -254,20 +410,139 @@ class MeshProxy:
                 violations = "; ".join(v[1] for v in guard_result.violations)
                 return False, f"read-only guard: {violations}"
 
+        # 8. Value-level taint (per-argument provenance)
+        if args and self._accumulator is not None:
+            for arg_name, arg_val in args.items():
+                if isinstance(arg_val, str) and len(arg_val) >= 3:
+                    self._accumulator.bind_from_tool_output(arg_name, arg_val, tool_name)
+
+        # 9. Plan verification (tool sequence vs user intent)
+        if self.enable_plan_verification and self._context.segments:
+            from tessera.plan_verifier import infer_spec_from_prompt, verify_sequence
+            user_segs = [
+                s for s in self._context.segments
+                if s.label.trust_level >= TrustLevel.USER
+            ]
+            if user_segs:
+                spec = infer_spec_from_prompt(user_segs[0].content)
+                result = verify_sequence(spec, [tool_name])
+                if not result.passed and result.score >= 0.5:
+                    return False, f"plan verifier: {'; '.join(result.violations)}"
+
+        # 10. Risk forecasting (salami detection, dynamic irreversibility)
+        if self._risk_forecaster is not None:
+            from tessera.risk.irreversibility import score_irreversibility
+            irrev = score_irreversibility(tool_name, args)
+            risk = self._risk_forecaster.record(tool_name, args, irrev_score=irrev.final_score)
+            if risk.should_pause:
+                return False, f"risk forecast: overall_risk={risk.overall_risk:.1f} (threshold exceeded)"
+
+        # 11. Toxic flow check
+        if args and not is_read_only:
+            from tessera.read_only_guard import check_toxic_flow
+            has_untrusted = any(
+                s.label.trust_level < TrustLevel.USER
+                for s in self._context.segments
+            )
+            has_sensitive = any(
+                kw in str(args).lower()
+                for kw in ("password", "api_key", "secret", "credential", "ssn")
+            )
+            toxic = check_toxic_flow(has_untrusted, has_sensitive, destination="external")
+            if toxic.toxic:
+                return False, f"toxic flow: {toxic.reason}"
+
+        # 12. Policy invariant: assert no bypass before allowing
+        try:
+            self._invariant_checker.assert_before_tool(session_id, tool_name)
+        except Exception:
+            return False, "policy invariant: tool execution without policy evaluation"
+
+        # Telemetry span (no-op if disabled)
+        if self._exports is not None:
+            self._exports.emit_decision_span(decision)
+
         return True, "allowed"
 
     def scan_and_label(
         self,
         tool_name: str,
         output_text: str,
+        raw_output: Any = None,
     ) -> tuple[str, TrustLevel]:
-        """Scan tool output, label, and add to context."""
+        """Scan tool output, label, and add to context.
+
+        Args:
+            tool_name: Name of the tool that produced the output.
+            output_text: Text content of the tool output.
+            raw_output: Optional raw output for binary content inspection.
+
+        Returns:
+            Tuple of (possibly redacted text, assigned trust level).
+        """
         from tessera.scanners.directive import scan_directive
         from tessera.scanners.heuristic import injection_scores
         from tessera.scanners.tool_output_schema import (
             ToolOutputKind, _resolve_kind, scan_tool_output,
         )
 
+        # -- Phase 0: binary content inspection (images, PDFs, audio) --
+        if raw_output is not None:
+            from tessera.content_inspector import inspect_content, TrustRecommendation
+            inspection = inspect_content(raw_output, tool_name)
+            if inspection.threats:
+                from tessera.events import EventKind, SecurityEvent, emit
+                emit(SecurityEvent.now(
+                    kind=EventKind.CONTENT_INJECTION_DETECTED,
+                    principal=self.principal,
+                    detail={
+                        "scanner": "content_inspector",
+                        "tool_name": tool_name,
+                        "content_type": inspection.content_type.value,
+                        "threats": list(inspection.threats),
+                    },
+                ))
+            if inspection.extracted_text:
+                output_text = inspection.extracted_text
+            if inspection.trust == TrustRecommendation.BLOCKED:
+                seg = make_segment(
+                    output_text or "[blocked binary content]",
+                    Origin.WEB, self.principal, self.signing_key,
+                    trust_level=TrustLevel.UNTRUSTED,
+                )
+                self._context.add(seg)
+                return output_text or "[blocked binary content]", TrustLevel.UNTRUSTED
+
+        # -- Phase 1: secret redaction --
+        if self._secret_registry is not None and len(self._secret_registry) > 0:
+            from tessera.redaction import redact_nested
+            output_text, redacted = redact_nested(output_text, self._secret_registry)
+
+        # -- Phase 1b: PII scanning and redaction --
+        pii_entities: list = []
+        if self._pii_scanner is not None:
+            pii_entities = self._pii_scanner.scan(output_text)
+            if pii_entities:
+                output_text = self._pii_scanner.redact(output_text)
+                from tessera.events import EventKind, SecurityEvent, emit
+                emit(SecurityEvent.now(
+                    kind=EventKind.CONTENT_INJECTION_DETECTED,
+                    principal=self.principal,
+                    detail={
+                        "scanner": "pii",
+                        "tool_name": tool_name,
+                        "entity_types": list({e.entity_type for e in pii_entities}),
+                        "entity_count": len(pii_entities),
+                        "owasp": "LLM02",
+                    },
+                ))
+
+        # -- Phase 1c: Unicode hidden content --
+        from tessera.scanners.unicode import scan_unicode_tags
+        unicode_result = scan_unicode_tags(output_text)
+        unicode_tainted = unicode_result.detected
+
+        # -- Phase 2: text scanners --
         output_kind = _resolve_kind(tool_name)
         is_free_text = output_kind == ToolOutputKind.FREE_TEXT
 
@@ -291,11 +566,34 @@ class MeshProxy:
                 or s_result.violation or window_corroborated
             )
 
+        # Phase 2b: intent verification (unrequested actions)
+        from tessera.scanners.intent import scan_intent
+        user_segs = [
+            s for s in self._context.segments
+            if s.label.trust_level >= TrustLevel.USER
+        ]
+        user_prompt = user_segs[0].content if user_segs else None
+        intent_result = scan_intent(output_text, user_prompt)
+        if intent_result.suspicious:
+            is_tainted = True
+
+        # Unicode hidden content forces taint
+        if unicode_tainted:
+            is_tainted = True
+
         trust = TrustLevel.UNTRUSTED if is_tainted else TrustLevel.USER
         origin = Origin.WEB if is_tainted else Origin.TOOL
 
+        # -- Phase 3: canary injection (before adding to context) --
+        labeled_text = output_text
+        if self._canary_tracker is not None:
+            seg_id = f"seg_{len(self._context.segments)}"
+            labeled_text, _token = self._canary_tracker.inject_segment(seg_id, output_text)
+            if is_tainted:
+                self._canary_tracker.flag_directive(seg_id)
+
         seg = make_segment(
-            output_text, origin, self.principal, self.signing_key,
+            labeled_text, origin, self.principal, self.signing_key,
             trust_level=trust,
         )
         self._context.add(seg)
@@ -328,15 +626,183 @@ class MeshProxy:
     def check_tool_definition(
         self, server_uri: str, tool_name: str, definition: str,
     ) -> bool:
-        """Check for rug-pull: tool definition changed since last seen."""
-        return self._definition_tracker.has_changed(server_uri, tool_name, definition)
+        """Check for rug-pull and tool description poisoning."""
+        changed = self._definition_tracker.has_changed(server_uri, tool_name, definition)
+        # Scan for tool description poisoning regardless of change
+        from tessera.scanners.tool_descriptions import scan_tool
+        poison_result = scan_tool(tool_name, definition)
+        if poison_result.poisoned:
+            from tessera.events import EventKind, SecurityEvent, emit
+            emit(SecurityEvent.now(
+                kind=EventKind.CONTENT_INJECTION_DETECTED,
+                principal=self.principal,
+                detail={
+                    "scanner": "tool_description",
+                    "tool_name": tool_name,
+                    "server_uri": server_uri,
+                    "severity": poison_result.max_severity.value,
+                    "matches": len(poison_result.matches),
+                },
+            ))
+        return changed or poison_result.poisoned
 
-    def add_user_prompt(self, prompt: str) -> None:
+    def check_tool_shadows(
+        self,
+        server_tools: dict[str, list[str]],
+    ) -> dict[str, Any]:
+        """Detect cross-server tool name shadowing (typosquatting).
+
+        Args:
+            server_tools: Mapping of server_name to list of tool names.
+
+        Returns:
+            Shadow scan result with detected pairs.
+        """
+        from tessera.scanners.tool_shadow import scan_cross_server_shadows
+        result = scan_cross_server_shadows(server_tools, principal=self.principal)
+        return {
+            "shadowed": result.shadowed,
+            "pairs": [
+                {
+                    "tool_a": p.tool_a, "server_a": p.server_a,
+                    "tool_b": p.tool_b, "server_b": p.server_b,
+                    "distance": p.distance,
+                }
+                for p in result.pairs
+            ],
+        }
+
+    def add_user_prompt(self, prompt: str) -> tuple[bool, str]:
+        """Add a user prompt to the context, with optional screening.
+
+        Returns (passed, reason). If screening fails, the prompt is still
+        added but labeled UNTRUSTED to prevent a phished prompt from
+        carrying USER trust.
+        """
+        if self.enable_prompt_screening:
+            from tessera.scanners.prompt_screen import screen_and_emit
+            result = screen_and_emit(prompt, principal=self.principal)
+            if not result.passed:
+                seg = make_segment(
+                    prompt, Origin.USER, self.principal, self.signing_key,
+                    trust_level=TrustLevel.UNTRUSTED,
+                )
+                self._context.add(seg)
+                return False, f"prompt screening failed: {result.reason}"
+
+        # Check for delegated prompt injection (instructions from external content)
+        if self._identity is not None:
+            delegation = self._identity.detect_delegation(prompt)
+            if delegation["detected"] and delegation["requires_confirmation"]:
+                seg = make_segment(
+                    prompt, Origin.USER, self.principal, self.signing_key,
+                    trust_level=TrustLevel.TOOL,
+                )
+                self._context.add(seg)
+                return True, f"delegation detected: {delegation['source_description']}"
+
         seg = make_segment(prompt, Origin.USER, self.principal, self.signing_key)
         self._context.add(seg)
+        return True, "clean"
+
+    def build_provenance_manifest(self) -> dict[str, Any]:
+        """Build a signed provenance manifest for the current context."""
+        from tessera.provenance import ContextSegmentEnvelope, PromptProvenanceManifest
+        envelopes = [
+            ContextSegmentEnvelope.from_segment(
+                seg, issuer=self.principal, key=self.signing_key,
+            )
+            for seg in self._context.segments
+        ]
+        if not envelopes:
+            return {"segments": 0, "manifest": None}
+        manifest = PromptProvenanceManifest.assemble(
+            envelopes, assembled_by=self.principal, key=self.signing_key,
+        )
+        return {"segments": len(envelopes), "manifest": manifest.to_dict()}
+
+    def split_context(self) -> dict[str, Any]:
+        """Split context into trusted and untrusted halves."""
+        from tessera.quarantine import split_by_trust
+        trusted, untrusted = split_by_trust(self._context)
+        return {
+            "trusted_segments": len(trusted.segments),
+            "untrusted_segments": len(untrusted.segments),
+            "trusted_min_trust": int(trusted.min_trust),
+            "untrusted_min_trust": int(untrusted.min_trust) if untrusted.segments else 0,
+        }
+
+    def export_evidence(self) -> dict[str, Any]:
+        """Flush the evidence buffer and return a signed evidence bundle."""
+        from tessera.evidence import EvidenceBundle, HMACEvidenceSigner
+        bundle = EvidenceBundle.from_buffer(self._evidence_buffer)
+        signer = HMACEvidenceSigner(key=self.signing_key, issuer=self.principal)
+        signed = signer.sign(bundle)
+        return signed.to_dict()
+
+    def resolve_approval(
+        self,
+        session_id: str,
+        approved: bool,
+        approver: str,
+        reason: str = "",
+    ) -> dict[str, Any]:
+        """Resolve a pending approval request."""
+        decision = self._session_store.resolve(session_id, approved, approver, reason)
+        if not approved:
+            self._cooldown.record_denial()
+        return {
+            "resolved": True,
+            "approved": approved,
+            "approver": approver,
+            "escalation_level": self._cooldown.state().level,
+        }
+
+    def check_output_provenance(self, model_response: str, user_task: str = "") -> dict:
+        """Post-generation check for output manipulation.
+
+        Detects when injected content influences the model's text response
+        (the travel-injection attack class where there is no tool call to
+        block but the model echoes attacker content).
+        """
+        from tessera.output_monitor import check_output_integrity
+        result = check_output_integrity(
+            model_response, self._context, user_task=user_task,
+        )
+        return {
+            "safe": result.action != "block",
+            "action": result.action,
+            "score": result.score,
+            "patterns": list(result.patterns_matched),
+        }
+
+    def check_canary_leakage(self, model_response: str) -> list[dict]:
+        """Check if model response contains canary tokens from tainted segments."""
+        if self._canary_tracker is None:
+            return []
+        influences = self._canary_tracker.check_response(model_response)
+        return [
+            {
+                "segment_id": inf.segment_id,
+                "canary_token": inf.canary_token,
+                "was_directive": inf.was_directive,
+            }
+            for inf in influences
+        ]
+
+    def register_secret(self, name: str, value: str) -> None:
+        """Register a secret for automatic redaction from tool outputs."""
+        if self._secret_registry is not None:
+            self._secret_registry.add(name, value)
 
     def reset_context(self) -> None:
         self._context = Context()
+        if self._accumulator is not None:
+            from tessera.taint import DependencyAccumulator
+            self._accumulator = DependencyAccumulator(context=self._context)
+        if self._risk_forecaster is not None:
+            from tessera.risk.forecaster import SessionRiskForecaster
+            self._risk_forecaster = SessionRiskForecaster()
 
     @property
     def context(self) -> Context:
@@ -360,7 +826,7 @@ class MeshProxy:
         from fastapi import FastAPI, Header
         from typing import Optional
 
-        app = FastAPI(title="AgentMesh Proxy", version="0.2.0")
+        app = FastAPI(title="AgentMesh Proxy", version="0.3.0")
         proxy = self
 
         @app.get("/healthz")
@@ -368,6 +834,7 @@ class MeshProxy:
             return {
                 "status": "ok",
                 "service": "agentmesh-proxy",
+                "version": "0.3.0",
                 "context_segments": len(proxy._context.segments),
                 "min_trust": int(proxy._context.min_trust),
                 "guardrail_enabled": proxy._guardrail is not None,
@@ -375,6 +842,12 @@ class MeshProxy:
                 "rate_limiter_active": proxy._rate_limiter is not None,
                 "mcp_allowlist_active": proxy._mcp_allowlist is not None,
                 "audit_chain_valid": proxy.audit_chain_valid,
+                "prompt_screening": proxy.enable_prompt_screening,
+                "trust_decay": proxy.enable_trust_decay,
+                "risk_forecasting": proxy.enable_risk_forecasting,
+                "plan_verification": proxy.enable_plan_verification,
+                "canary_tokens": proxy.enable_canary_tokens,
+                "cel_rules": proxy._policy.cel_engine is not None,
             }
 
         @app.post("/v1/evaluate")
@@ -472,6 +945,144 @@ class MeshProxy:
                 "sequences_valid": proxy._audit_log.verify_sequences(),
             }
 
+        @app.post("/v1/check-output")
+        def api_check_output(body: dict):
+            """Post-generation output provenance and integrity check."""
+            response = body.get("response", "")
+            user_task = body.get("user_task", "")
+            provenance = proxy.check_output_provenance(response, user_task)
+            canary = proxy.check_canary_leakage(response)
+            return {
+                "provenance": provenance,
+                "canary_leakage": canary,
+                "safe": provenance["safe"] and len(canary) == 0,
+            }
+
+        @app.get("/v1/xds/snapshot")
+        def api_xds_snapshot():
+            """Serve current policy as an xDS-compatible snapshot.
+
+            This is a simplified REST fallback for environments that cannot
+            run the gRPC xDS server. Production deployments should use the
+            gRPC xDS endpoint in tessera.xds.
+            """
+            reqs = {}
+            for key, r in proxy._policy.requirements.items():
+                name, _ = key
+                reqs[name] = {
+                    "required_trust": int(r.required_trust),
+                    "side_effects": r.side_effects,
+                }
+            cel_rules = []
+            if proxy._policy.cel_engine is not None:
+                cel_rules = [
+                    {"name": r.name, "expression": r.expression}
+                    for r in proxy._policy.cel_engine._rules
+                ]
+            return {
+                "version": "v1",
+                "default_trust": int(proxy._policy.default_required_trust),
+                "requirements": reqs,
+                "human_approval_tools": list(proxy._policy._human_approval_tools),
+                "cel_rules": cel_rules,
+                "rate_limit": {
+                    "max_calls": proxy.rate_limit_calls,
+                    "burst": proxy.rate_limit_burst,
+                },
+                "features": {
+                    "trust_decay": proxy.enable_trust_decay,
+                    "risk_forecasting": proxy.enable_risk_forecasting,
+                    "plan_verification": proxy.enable_plan_verification,
+                    "canary_tokens": proxy.enable_canary_tokens,
+                    "prompt_screening": proxy.enable_prompt_screening,
+                    "secret_redaction": proxy.enable_secret_redaction,
+                },
+            }
+
+        # -- Tier A+B endpoints --
+
+        @app.get("/v1/provenance")
+        def api_provenance():
+            """Build and return a signed provenance manifest."""
+            return proxy.build_provenance_manifest()
+
+        @app.get("/v1/context/split")
+        def api_context_split():
+            """Split context into trusted and untrusted halves."""
+            return proxy.split_context()
+
+        @app.get("/v1/evidence")
+        def api_evidence():
+            """Export signed evidence bundle from event buffer."""
+            return proxy.export_evidence()
+
+        @app.post("/v1/approve")
+        def api_approve(body: _ApprovalRequest):
+            """Resolve a pending human approval request."""
+            return proxy.resolve_approval(
+                body.session_id, body.approved, body.approver,
+            )
+
+        @app.get("/v1/audit/sarif")
+        def api_sarif():
+            """Export security events as SARIF 2.1.0 JSON."""
+            if proxy._exports is None:
+                return {"error": "exports not configured"}
+            return proxy._exports.export_sarif()
+
+        @app.post("/v1/rag/scan")
+        def api_rag_scan(body: dict):
+            """Scan RAG retrieval chunks for injection."""
+            if proxy._transport is None:
+                return {"error": "RAG guard not enabled"}
+            text = body.get("text", "")
+            source_id = body.get("source_id", "unknown")
+            user_prompt = body.get("user_prompt")
+            return proxy._transport.scan_rag_chunk(text, source_id, user_prompt)
+
+        @app.post("/v1/mcp/baseline")
+        def api_mcp_baseline(body: dict):
+            """Snapshot current tool definitions for drift detection."""
+            if proxy._transport is None:
+                return {"error": "transport not enabled"}
+            tools = body.get("tools", [])
+            server = body.get("server_name", "default")
+            return proxy._transport.snapshot_baseline(tools, server)
+
+        @app.post("/v1/mcp/drift")
+        def api_mcp_drift(body: dict):
+            """Check current tools against baseline for drift."""
+            if proxy._transport is None:
+                return {"error": "transport not enabled"}
+            tools = body.get("tools", [])
+            server = body.get("server_name", "default")
+            return proxy._transport.check_drift(tools, server)
+
+        @app.post("/v1/tool-shadows")
+        def api_tool_shadows(body: dict):
+            """Check for cross-server tool name shadowing."""
+            server_tools = body.get("server_tools", {})
+            return proxy.check_tool_shadows(server_tools)
+
+        @app.get("/v1/liveness/{agent_id}")
+        def api_liveness(agent_id: str):
+            """Check liveness state for an agent."""
+            if proxy._identity is None:
+                return {"agent_id": agent_id, "alive": True, "tracked": False}
+            return proxy._identity.liveness_state(agent_id)
+
+        @app.post("/v1/heartbeat")
+        def api_heartbeat(body: dict):
+            """Record a heartbeat for an agent."""
+            agent_id = body.get("agent_id", "")
+            if proxy._identity is not None:
+                proxy._identity.heartbeat(agent_id)
+            return {"status": "ok", "agent_id": agent_id}
+
+        # Mount xDS server endpoints if enabled
+        if proxy._exports is not None:
+            proxy._exports.mount_xds_endpoints(app)
+
         return app
 
     def run(self, host: str = "0.0.0.0", port: int = 9090) -> None:
@@ -486,6 +1097,20 @@ class MeshProxy:
         if self._mcp_allowlist:
             features.append("allowlist")
         features.append(f"rate-limit({self.rate_limit_calls}/window)")
+        if self.enable_prompt_screening:
+            features.append("prompt-screening")
+        if self._secret_registry and len(self._secret_registry) > 0:
+            features.append("secret-redaction")
+        if self.enable_trust_decay:
+            features.append("trust-decay")
+        if self.enable_risk_forecasting:
+            features.append("risk-forecasting")
+        if self.enable_plan_verification:
+            features.append("plan-verification")
+        if self.enable_canary_tokens:
+            features.append("canary-tokens")
+        if self._policy.cel_engine is not None:
+            features.append("cel-rules")
 
         print(f"AgentMesh proxy starting on {host}:{port}")
         print(f"Upstream: {self.upstream_url}")
@@ -498,6 +1123,9 @@ def main() -> None:
     allowlist_raw = os.environ.get("AGENTMESH_MCP_ALLOWLIST", "")
     allowlist = [p.strip() for p in allowlist_raw.split(",") if p.strip()] if allowlist_raw else []
 
+    def _bool_env(key: str, default: str = "false") -> bool:
+        return os.environ.get(key, default).lower() == "true"
+
     proxy = MeshProxy(
         upstream_url=os.environ.get("AGENTMESH_UPSTREAM_URL", "http://localhost:3000"),
         policy_path=os.environ.get("AGENTMESH_POLICY_PATH", "policy.yaml"),
@@ -505,10 +1133,20 @@ def main() -> None:
         principal=os.environ.get("AGENTMESH_PRINCIPAL", "agentmesh-proxy"),
         guardrail_provider=os.environ.get("AGENTMESH_GUARDRAIL_PROVIDER"),
         guardrail_model=os.environ.get("AGENTMESH_GUARDRAIL_MODEL"),
-        require_identity=os.environ.get("AGENTMESH_REQUIRE_IDENTITY", "").lower() == "true",
+        require_identity=_bool_env("AGENTMESH_REQUIRE_IDENTITY"),
         mcp_allowlist_patterns=allowlist,
         rate_limit_calls=int(os.environ.get("AGENTMESH_RATE_LIMIT", "50")),
         rate_limit_burst=int(os.environ.get("AGENTMESH_BURST_LIMIT", "10")),
+        # Tier 2
+        enable_prompt_screening=_bool_env("AGENTMESH_PROMPT_SCREENING", "true"),
+        enable_secret_redaction=_bool_env("AGENTMESH_SECRET_REDACTION", "true"),
+        enable_pii_scanning=_bool_env("AGENTMESH_PII_SCANNING"),
+        # Tier 3
+        enable_trust_decay=_bool_env("AGENTMESH_TRUST_DECAY"),
+        enable_risk_forecasting=_bool_env("AGENTMESH_RISK_FORECASTING", "true"),
+        enable_plan_verification=_bool_env("AGENTMESH_PLAN_VERIFICATION", "true"),
+        enable_canary_tokens=_bool_env("AGENTMESH_CANARY_TOKENS"),
+        cel_rules_path=os.environ.get("AGENTMESH_CEL_RULES_PATH"),
     )
     port = int(os.environ.get("AGENTMESH_PORT", "9090"))
     proxy.run(port=port)

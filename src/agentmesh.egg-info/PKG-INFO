@@ -1,0 +1,15 @@
+Metadata-Version: 2.4
+Name: agentmesh
+Version: 0.1.0
+Summary: Agent security mesh composing Tessera, agentgateway, and SPIRE.
+License: AGPL-3.0-or-later
+Requires-Python: >=3.12
+Requires-Dist: tessera-mesh>=0.3.0
+Requires-Dist: fastapi>=0.110
+Requires-Dist: uvicorn>=0.29
+Requires-Dist: pyyaml>=6.0
+Provides-Extra: guardrail
+Requires-Dist: anthropic>=0.30; extra == "guardrail"
+Provides-Extra: dev
+Requires-Dist: pytest>=8; extra == "dev"
+Requires-Dist: httpx>=0.27; extra == "dev"

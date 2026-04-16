@@ -1,0 +1,11 @@
+README.md
+pyproject.toml
+src/agentmesh/__init__.py
+src/agentmesh/proxy.py
+src/agentmesh.egg-info/PKG-INFO
+src/agentmesh.egg-info/SOURCES.txt
+src/agentmesh.egg-info/dependency_links.txt
+src/agentmesh.egg-info/entry_points.txt
+src/agentmesh.egg-info/requires.txt
+src/agentmesh.egg-info/top_level.txt
+tests/test_proxy.py

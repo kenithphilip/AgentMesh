@@ -3,10 +3,13 @@ FROM python:3.12-slim
 WORKDIR /app
 
 # Install Tessera from PyPI with guardrail support
-RUN pip install --no-cache-dir tessera-mesh[mcp,cel,guardrail]==0.3.0 pyyaml uvicorn
+RUN pip install --no-cache-dir tessera-mesh[mcp,cel,guardrail]==0.3.0 pyyaml uvicorn fastapi
 
-# Copy the mesh proxy entrypoint
+# Copy the mesh proxy
+COPY src/agentmesh /app/agentmesh
 COPY deployment/docker/entrypoint-tessera.py /app/entrypoint.py
+
+ENV PYTHONPATH=/app
 
 EXPOSE 9090
 

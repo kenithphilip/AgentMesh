@@ -1,0 +1,11 @@
+tessera-mesh>=0.3.0
+fastapi>=0.110
+uvicorn>=0.29
+pyyaml>=6.0
+
+[dev]
+pytest>=8
+httpx>=0.27
+
+[guardrail]
+anthropic>=0.30

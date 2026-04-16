@@ -1,0 +1,56 @@
+# AgentMesh default policy.
+# Tools are deny-by-default (require USER trust for side-effecting tools).
+# Read-only tools are allowed even with tainted context.
+
+requirements:
+  # Side-effecting tools: require USER trust
+  - name: send_email
+    required_trust: user
+    side_effects: true
+    critical_args: [to, recipient, cc, bcc]
+
+  - name: send_money
+    required_trust: user
+    side_effects: true
+    critical_args: [recipient, to, account, iban, amount]
+
+  - name: "delete_*"
+    required_trust: user
+    side_effects: true
+
+  - name: "create_*"
+    required_trust: user
+    side_effects: true
+
+  - name: "update_*"
+    required_trust: user
+    side_effects: true
+
+  # Read-only tools: allowed even with tainted context
+  - name: "get_*"
+    required_trust: tool
+    side_effects: false
+
+  - name: "search_*"
+    required_trust: tool
+    side_effects: false
+
+  - name: "list_*"
+    required_trust: tool
+    side_effects: false
+
+  - name: "read_*"
+    required_trust: tool
+    side_effects: false
+
+  - name: "find_*"
+    required_trust: tool
+    side_effects: false
+
+default_trust: user
+scope: team
+
+human_approval_tools:
+  - transfer_funds
+  - delete_database
+  - execute_code

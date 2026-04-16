@@ -1,0 +1,120 @@
+# AgentMesh Team Tier: docker compose up
+#
+# Brings up a complete agent security mesh:
+# - SPIRE server + agent (workload identity)
+# - agentgateway (MCP/A2A proxy)
+# - Tessera proxy (policy enforcement + content scanning)
+# - OTel collector (observability)
+# - Demo MCP tool server (for testing)
+#
+# Usage:
+#   cd deployment/docker
+#   docker compose up
+#
+# Then run the demo agent:
+#   python examples/demo_agent.py
+
+services:
+  # ── Identity Layer ──────────────────────────────────────────
+  spire-server:
+    image: ghcr.io/spiffe/spire-server:1.11.0
+    hostname: spire-server
+    volumes:
+      - ./config/spire/server.conf:/opt/spire/conf/server/server.conf:ro
+      - ./config/spire/registration.json:/opt/spire/conf/server/registration.json:ro
+      - spire-data:/run/spire/data
+    command: ["-config", "/opt/spire/conf/server/server.conf"]
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["/opt/spire/bin/spire-server", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  spire-agent:
+    image: ghcr.io/spiffe/spire-agent:1.11.0
+    hostname: spire-agent
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    volumes:
+      - ./config/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - spire-agent-socket:/tmp/spire-agent
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: ["-config", "/opt/spire/conf/agent/agent.conf"]
+    pid: "host"
+    restart: unless-stopped
+
+  # Register workload entries after SPIRE is up
+  spire-registration:
+    image: ghcr.io/spiffe/spire-server:1.11.0
+    depends_on:
+      spire-server:
+        condition: service_healthy
+    volumes:
+      - ./config/spire/register-entries.sh:/register.sh:ro
+    entrypoint: ["/bin/sh", "/register.sh"]
+
+  # ── Data Plane ──────────────────────────────────────────────
+  agentgateway:
+    image: ghcr.io/agentgateway/agentgateway:latest
+    hostname: agentgateway
+    depends_on:
+      - spire-agent
+    volumes:
+      - ./config/agentgateway/config.yaml:/app/config.yaml:ro
+    ports:
+      - "8080:8080"   # MCP SSE endpoint
+      - "8443:8443"   # Admin API
+    environment:
+      AGENTGATEWAY_CONFIG: /app/config.yaml
+    restart: unless-stopped
+
+  # ── Security Layer ──────────────────────────────────────────
+  tessera-proxy:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.tessera
+    hostname: tessera-proxy
+    depends_on:
+      - spire-agent
+      - agentgateway
+    volumes:
+      - spire-agent-socket:/tmp/spire-agent:ro
+      - ./config/tessera/policy.yaml:/app/policy.yaml:ro
+    ports:
+      - "9090:9090"   # Tessera proxy API
+    environment:
+      TESSERA_POLICY_PATH: /app/policy.yaml
+      TESSERA_UPSTREAM_URL: http://agentgateway:8080
+      TESSERA_SIGNING_KEY: mesh-signing-key-replace-in-production
+      SPIFFE_ENDPOINT_SOCKET: unix:///tmp/spire-agent/api.sock
+    restart: unless-stopped
+
+  # ── Observability ───────────────────────────────────────────
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.100.0
+    hostname: otel-collector
+    volumes:
+      - ./config/otel/collector.yaml:/etc/otelcol/config.yaml:ro
+    ports:
+      - "4317:4317"   # OTLP gRPC
+      - "4318:4318"   # OTLP HTTP
+      - "8888:8888"   # Prometheus metrics
+    restart: unless-stopped
+
+  # ── Demo Tool Server ────────────────────────────────────────
+  demo-tools:
+    build:
+      context: ../..
+      dockerfile: deployment/docker/Dockerfile.demo-tools
+    hostname: demo-tools
+    ports:
+      - "3000:3000"   # MCP SSE endpoint
+    restart: unless-stopped
+
+volumes:
+  spire-data:
+  spire-agent-socket:

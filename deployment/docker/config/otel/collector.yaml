@@ -1,0 +1,37 @@
+# OTel collector config for AgentMesh.
+# Routes security events to stdout for development.
+# Production: replace stdout exporter with SIEM endpoint.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 1s
+    send_batch_size: 100
+
+  # Filter: only forward security-relevant events
+  filter/security:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["tessera.event_kind"] != nil'
+
+exporters:
+  # Development: security events to stdout
+  logging:
+    verbosity: detailed
+    sampling_initial: 100
+    sampling_thereafter: 100
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [logging]

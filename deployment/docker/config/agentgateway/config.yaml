@@ -1,0 +1,22 @@
+# agentgateway configuration for AgentMesh Team tier.
+#
+# Routes MCP tool calls through the Tessera proxy for
+# policy enforcement and content scanning.
+
+version: v1
+
+listeners:
+  - name: mcp-listener
+    protocol: MCP
+    address: 0.0.0.0:8080
+    sse: true
+
+targets:
+  - name: demo-tools
+    protocol: MCP
+    address: demo-tools:3000
+    sse: true
+
+  - name: tessera-proxy
+    protocol: HTTP
+    address: tessera-proxy:9090

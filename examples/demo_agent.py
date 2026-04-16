@@ -75,7 +75,7 @@ def main() -> None:
     key = b"demo-key"
     ctx = Context()
     ctx.add(make_segment("Find hotels in Paris and email me the best one", Origin.USER, "demo", key))
-    ctx.add(make_segment(json.dumps(json.loads(result["result"])[:1]) if isinstance(result["result"], str) else str(result["result"]), Origin.TOOL, "demo", key))
+    ctx.add(make_segment(str(result["result"])[:200], Origin.TOOL, "demo", key))
     ctx.add(make_segment(content, Origin.WEB, "demo", key))
 
     # Evaluate policy

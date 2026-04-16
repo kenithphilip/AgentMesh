@@ -17,33 +17,31 @@
 services:
   # ── Identity Layer ──────────────────────────────────────────
   spire-server:
-    image: ghcr.io/spiffe/spire-server:1.11.0
+    image: ghcr.io/spiffe/spire-server:1.11.2
     hostname: spire-server
     volumes:
-      - ./config/spire/server.conf:/opt/spire/conf/server/server.conf:ro
-      - ./config/spire/registration.json:/opt/spire/conf/server/registration.json:ro
-      - spire-data:/run/spire/data
+      - ./config/spire:/opt/spire/conf/server
     command: ["-config", "/opt/spire/conf/server/server.conf"]
     ports:
       - "8081:8081"
     healthcheck:
-      test: ["/opt/spire/bin/spire-server", "healthcheck"]
+      test: ["CMD", "/opt/spire/bin/spire-server", "healthcheck"]
       interval: 5s
       timeout: 3s
       retries: 10
     restart: unless-stopped
 
   spire-agent:
-    image: ghcr.io/spiffe/spire-agent:1.11.0
+    image: ghcr.io/spiffe/spire-agent:1.11.2
     hostname: spire-agent
     depends_on:
       spire-server:
         condition: service_healthy
     volumes:
-      - ./config/spire/agent.conf:/opt/spire/conf/agent/agent.conf:ro
+      - ./config/spire-agent:/opt/spire/conf/agent
       - spire-agent-socket:/tmp/spire-agent
       - /var/run/docker.sock:/var/run/docker.sock:ro
-    command: ["-config", "/opt/spire/conf/agent/agent.conf"]
+    command: ["-config", "/opt/spire/conf/agent/agent.conf", "-joinToken", "${SPIRE_JOIN_TOKEN:-placeholder}"]
     pid: "host"
     restart: unless-stopped
 

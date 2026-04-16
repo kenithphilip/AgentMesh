@@ -89,9 +89,18 @@ services:
       TESSERA_UPSTREAM_URL: http://agentgateway:8080
       TESSERA_SIGNING_KEY: mesh-signing-key-replace-in-production
       SPIFFE_ENDPOINT_SOCKET: unix:///tmp/spire-agent/api.sock
-      # LLM guardrail (optional): set these to enable semantic
-      # classification on ambiguous FREE_TEXT tool outputs.
-      # Without these, only deterministic scanners run (zero LLM cost).
+      AGENTMESH_TRUST_DOMAIN: agentmesh.local
+      AGENTMESH_PROMPT_SCREENING: "true"
+      AGENTMESH_SECRET_REDACTION: "true"
+      AGENTMESH_RISK_FORECASTING: "true"
+      AGENTMESH_PLAN_VERIFICATION: "true"
+      AGENTMESH_SARIF: "true"
+      # Optional features (disabled by default):
+      # AGENTMESH_PII_SCANNING: "true"
+      # AGENTMESH_TRUST_DECAY: "true"
+      # AGENTMESH_CANARY_TOKENS: "true"
+      # AGENTMESH_RAG_GUARD: "true"
+      # AGENTMESH_TELEMETRY: "true"
       # TESSERA_GUARDRAIL_PROVIDER: anthropic
       # TESSERA_GUARDRAIL_MODEL: claude-haiku-4-5-20251001
       # ANTHROPIC_API_KEY: your-key-here

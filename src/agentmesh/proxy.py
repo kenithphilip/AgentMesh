@@ -76,6 +76,34 @@ class _ApprovalRequest(BaseModel):
     approved: bool = False
 
 
+class _CheckServerRequest(BaseModel):
+    server_uri: str
+
+
+class _CheckOutputRequest(BaseModel):
+    response: str
+    user_task: str = ""
+
+
+class _RAGScanRequest(BaseModel):
+    text: str
+    source_id: str = "unknown"
+    user_prompt: str | None = None
+
+
+class _MCPBaselineRequest(BaseModel):
+    tools: list[dict] = []
+    server_name: str = "default"
+
+
+class _ToolShadowRequest(BaseModel):
+    server_tools: dict[str, list[str]] = {}
+
+
+class _HeartbeatRequest(BaseModel):
+    agent_id: str
+
+
 @dataclass
 class MeshProxy:
     """AgentMesh MCP proxy with full enterprise defense stack.
@@ -931,9 +959,8 @@ class MeshProxy:
             }
 
         @app.post("/v1/check-server")
-        def api_check_server(body: dict):
-            uri = body.get("server_uri", "")
-            allowed, reason = proxy.check_mcp_server(uri)
+        def api_check_server(body: _CheckServerRequest):
+            allowed, reason = proxy.check_mcp_server(body.server_uri)
             return {"allowed": allowed, "reason": reason}
 
         @app.get("/v1/audit")
@@ -946,12 +973,10 @@ class MeshProxy:
             }
 
         @app.post("/v1/check-output")
-        def api_check_output(body: dict):
+        def api_check_output(body: _CheckOutputRequest):
             """Post-generation output provenance and integrity check."""
-            response = body.get("response", "")
-            user_task = body.get("user_task", "")
-            provenance = proxy.check_output_provenance(response, user_task)
-            canary = proxy.check_canary_leakage(response)
+            provenance = proxy.check_output_provenance(body.response, body.user_task)
+            canary = proxy.check_canary_leakage(body.response)
             return {
                 "provenance": provenance,
                 "canary_leakage": canary,
@@ -1031,38 +1056,30 @@ class MeshProxy:
             return proxy._exports.export_sarif()
 
         @app.post("/v1/rag/scan")
-        def api_rag_scan(body: dict):
+        def api_rag_scan(body: _RAGScanRequest):
             """Scan RAG retrieval chunks for injection."""
             if proxy._transport is None:
                 return {"error": "RAG guard not enabled"}
-            text = body.get("text", "")
-            source_id = body.get("source_id", "unknown")
-            user_prompt = body.get("user_prompt")
-            return proxy._transport.scan_rag_chunk(text, source_id, user_prompt)
+            return proxy._transport.scan_rag_chunk(body.text, body.source_id, body.user_prompt)
 
         @app.post("/v1/mcp/baseline")
-        def api_mcp_baseline(body: dict):
+        def api_mcp_baseline(body: _MCPBaselineRequest):
             """Snapshot current tool definitions for drift detection."""
             if proxy._transport is None:
                 return {"error": "transport not enabled"}
-            tools = body.get("tools", [])
-            server = body.get("server_name", "default")
-            return proxy._transport.snapshot_baseline(tools, server)
+            return proxy._transport.snapshot_baseline(body.tools, body.server_name)
 
         @app.post("/v1/mcp/drift")
-        def api_mcp_drift(body: dict):
+        def api_mcp_drift(body: _MCPBaselineRequest):
             """Check current tools against baseline for drift."""
             if proxy._transport is None:
                 return {"error": "transport not enabled"}
-            tools = body.get("tools", [])
-            server = body.get("server_name", "default")
-            return proxy._transport.check_drift(tools, server)
+            return proxy._transport.check_drift(body.tools, body.server_name)
 
         @app.post("/v1/tool-shadows")
-        def api_tool_shadows(body: dict):
+        def api_tool_shadows(body: _ToolShadowRequest):
             """Check for cross-server tool name shadowing."""
-            server_tools = body.get("server_tools", {})
-            return proxy.check_tool_shadows(server_tools)
+            return proxy.check_tool_shadows(body.server_tools)
 
         @app.get("/v1/liveness/{agent_id}")
         def api_liveness(agent_id: str):
@@ -1072,12 +1089,11 @@ class MeshProxy:
             return proxy._identity.liveness_state(agent_id)
 
         @app.post("/v1/heartbeat")
-        def api_heartbeat(body: dict):
+        def api_heartbeat(body: _HeartbeatRequest):
             """Record a heartbeat for an agent."""
-            agent_id = body.get("agent_id", "")
             if proxy._identity is not None:
-                proxy._identity.heartbeat(agent_id)
-            return {"status": "ok", "agent_id": agent_id}
+                proxy._identity.heartbeat(body.agent_id)
+            return {"status": "ok", "agent_id": body.agent_id}
 
         # Mount xDS server endpoints if enabled
         if proxy._exports is not None:

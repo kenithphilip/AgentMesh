@@ -16,7 +16,7 @@ plane, and OpenTelemetry observability.
 
 ```bash
 # Install
-pip install agentmesh tessera-mesh
+pip install agentmesh-mesh tessera-mesh
 
 # Start the demo tools server
 python examples/demo_tools_server.py &
@@ -177,6 +177,12 @@ Upstream MCP server (agentgateway or direct)
 pip install -e '.[dev]' tessera-mesh[agentmesh,cel,sessions]
 pytest tests/ -v
 # 106 passed in 5.5s
+```
+
+Install from PyPI:
+
+```bash
+pip install agentmesh-mesh
 ```
 
 ## Repository structure

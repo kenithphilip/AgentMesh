@@ -109,6 +109,20 @@ class _ClassifyRequest(BaseModel):
     trajectory_id: str | None = None
 
 
+class _LabelRequest(BaseModel):
+    seq: int
+    hash: str
+    label: str  # "correct" | "incorrect" | "unreviewed"
+
+
+class _ReplayRequest(BaseModel):
+    kinds: list[str] | None = None
+    trajectory_id: str | None = None
+    since: str | None = None  # ISO-8601
+    until: str | None = None  # ISO-8601
+    candidate: str = "current_policy"
+
+
 @dataclass
 class MeshProxy:
     """AgentMesh MCP proxy with full enterprise defense stack.
@@ -157,6 +171,10 @@ class MeshProxy:
     audit_log_path: str | None = None
     audit_log_seal_key: bytes | None = None
     audit_log_fsync_every: int = 1
+
+    # Ground-truth labels for replay scoring. Persisted as JSON.
+    # Defaults to ``<audit_log_path>.labels.json`` when audit log is on.
+    audit_label_path: str | None = None
 
     # Tier A+B: identity, transport, exports
     trust_domain: str = "agentmesh.local"
@@ -215,6 +233,7 @@ class MeshProxy:
     _supply_chain_scanner: Any = field(default=None, init=False, repr=False)
     _yara_scanner: Any = field(default=None, init=False, repr=False)
     _audit_sink: Any = field(default=None, init=False, repr=False)
+    _label_store: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -278,6 +297,20 @@ class MeshProxy:
                 seal_key=self.audit_log_seal_key,
             )
             register_sink(self._audit_sink)
+
+        # 5c. Replay label store. Author-time ground-truth annotations
+        # live alongside the audit log but are mutable by design. When
+        # audit_label_path is set (or defaulted from audit_log_path),
+        # labels persist across restarts so replay scoring is stable.
+        from tessera.replay import LabelStore
+        label_path = self.audit_label_path
+        if label_path is None and self.audit_log_path:
+            label_path = f"{self.audit_log_path}.labels.json"
+        if label_path is not None:
+            self._label_store = LabelStore.load(label_path)
+            self.audit_label_path = label_path
+        else:
+            self._label_store = LabelStore()
 
         # 6. Initialize tool definition tracker (rug-pull detection)
         from tessera.mcp_allowlist import ToolDefinitionTracker
@@ -1057,6 +1090,64 @@ class MeshProxy:
         return self._audit_log.verify_chain()
 
     # ------------------------------------------------------------------
+    # Replay
+    # ------------------------------------------------------------------
+
+    def _current_policy_candidate(self, envelope: Any) -> Any:
+        """Built-in replay candidate: what would the current Policy decide?
+
+        Rebuilds a :class:`Context` from the envelope's recorded segments
+        (trust levels are what drives policy; content is SHA-256 only, so
+        we use that as the placeholder text), then calls
+        ``self._policy.evaluate``. Returns a
+        :class:`tessera.replay.PolicyDecision`.
+
+        This does NOT run scanners, guardrail, sensitivity HWM, or risk
+        forecasting. Those are outputs of the request, not inputs to the
+        taint-tracking policy check; replaying them would require the
+        original plaintext. What this answers is the narrow but useful
+        question: "given the trust-label shape of the original request,
+        would my current Policy rules still produce the recorded verdict?"
+        """
+        from tessera.labels import Origin, TrustLevel
+        from tessera.policy import DecisionKind
+        from tessera.replay import PolicyDecision
+
+        ctx = Context()
+        for seg in envelope.segments:
+            try:
+                level = TrustLevel(int(seg.get("trust_level", 0)))
+            except (ValueError, TypeError):
+                level = TrustLevel.UNTRUSTED
+            placeholder = str(seg.get("content_sha256", ""))
+            ctx.add(make_segment(
+                placeholder,
+                Origin.WEB,
+                self.principal,
+                key=self.signing_key,
+                trust_level=level,
+            ))
+        decision = self._policy.evaluate(
+            context=ctx,
+            tool_name=envelope.tool_name,
+            args=envelope.args,
+        )
+        return PolicyDecision(
+            allowed=decision.kind == DecisionKind.ALLOW,
+            reason=decision.reason,
+            source="agentmesh.proxy.current_policy",
+        )
+
+    def set_audit_label(self, seq: int, record_hash: str, label: str) -> dict[str, Any]:
+        """Set (or update) the ground-truth label for an audit record."""
+        from tessera.replay import Label
+        lbl = Label(label)
+        self._label_store.set(seq, record_hash, lbl)
+        if self.audit_label_path is not None:
+            self._label_store.dump(self.audit_label_path)
+        return {"seq": seq, "hash": record_hash, "label": lbl.value}
+
+    # ------------------------------------------------------------------
     # HTTP API
     # ------------------------------------------------------------------
 
@@ -1289,6 +1380,161 @@ class MeshProxy:
                 "seal_valid": result.seal_valid,
                 "last_seq": proxy._audit_sink.last_seq,
                 "last_hash": proxy._audit_sink.last_hash,
+            }
+
+        @app.get("/v1/audit/cases")
+        def api_audit_cases(
+            kinds: str | None = None,
+            trajectory_id: str | None = None,
+            since: str | None = None,
+            until: str | None = None,
+            limit: int = 100,
+        ):
+            """List replayable cases from the audit log.
+
+            Only records whose ``detail`` carries a ``replay`` envelope
+            appear here. ``kinds`` is comma-separated. ``since``/``until``
+            are ISO-8601. Each case entry carries its current label (or
+            ``unreviewed``) so UIs can render ground-truth status
+            alongside the decision.
+            """
+            if proxy._audit_sink is None:
+                return {"configured": False, "cases": []}
+            from datetime import datetime
+            from tessera.replay import iter_replay_cases
+            kind_list = [k.strip() for k in kinds.split(",")] if kinds else None
+            since_dt = datetime.fromisoformat(since) if since else None
+            until_dt = datetime.fromisoformat(until) if until else None
+            cases = []
+            for case in iter_replay_cases(
+                proxy.audit_log_path,
+                kinds=kind_list,
+                since=since_dt,
+                until=until_dt,
+                trajectory_id=trajectory_id,
+            ):
+                label = proxy._label_store.get(case.seq, case.record_hash)
+                cases.append({
+                    "seq": case.seq,
+                    "hash": case.record_hash,
+                    "timestamp": case.timestamp,
+                    "trajectory_id": case.envelope.trajectory_id,
+                    "tool_name": case.envelope.tool_name,
+                    "decision_allowed": case.envelope.decision_allowed,
+                    "decision_source": case.envelope.decision_source,
+                    "decision_reason": case.envelope.decision_reason,
+                    "sensitivity_hwm": case.envelope.sensitivity_hwm,
+                    "label": label.value,
+                })
+                if len(cases) >= limit:
+                    break
+            return {"configured": True, "cases": cases, "count": len(cases)}
+
+        @app.post("/v1/audit/label")
+        def api_audit_label(body: _LabelRequest):
+            """Attach a ground-truth label to an audit record.
+
+            Label values: ``correct``, ``incorrect``, ``unreviewed``.
+            Persisted to ``audit_label_path`` if configured. Labels are
+            keyed by ``(seq, hash)`` so they survive chain migrations;
+            a stale hash yields ``unreviewed`` on subsequent reads.
+            """
+            try:
+                return proxy.set_audit_label(body.seq, body.hash, body.label)
+            except ValueError as e:
+                return {"error": str(e)}
+
+        @app.get("/v1/audit/labels")
+        def api_audit_labels():
+            """Return the full label map."""
+            raw = proxy._label_store.all()
+            return {
+                "path": proxy.audit_label_path,
+                "labels": {
+                    str(seq): {"hash": h, "label": lbl.value}
+                    for seq, (h, lbl) in raw.items()
+                },
+            }
+
+        @app.get("/v1/replay/candidates")
+        def api_replay_candidates():
+            """Available built-in replay candidates."""
+            return {
+                "candidates": [
+                    {
+                        "name": "current_policy",
+                        "description": (
+                            "Re-runs the proxy's current Policy against each "
+                            "envelope's recorded trust-label shape."
+                        ),
+                    },
+                ],
+            }
+
+        @app.post("/v1/replay/run")
+        def api_replay_run(body: _ReplayRequest):
+            """Replay historical decisions against a candidate policy.
+
+            Returns aggregate stats plus a per-case summary. Only
+            ``current_policy`` is built in; external tooling can pull
+            ``/v1/audit/cases`` and run any candidate of its own.
+            """
+            if proxy._audit_sink is None:
+                return {"configured": False}
+            if body.candidate != "current_policy":
+                return {
+                    "error": f"unknown candidate: {body.candidate}",
+                    "available": ["current_policy"],
+                }
+            from datetime import datetime
+            from tessera.replay import run_replay
+            since_dt = datetime.fromisoformat(body.since) if body.since else None
+            until_dt = datetime.fromisoformat(body.until) if body.until else None
+            stats, results = run_replay(
+                proxy.audit_log_path,
+                proxy._current_policy_candidate,
+                labels=proxy._label_store,
+                kinds=body.kinds,
+                since=since_dt,
+                until=until_dt,
+                trajectory_id=body.trajectory_id,
+            )
+            return {
+                "candidate": body.candidate,
+                "stats": {
+                    "total": stats.total,
+                    "agreed": stats.agreed,
+                    "disagreed": stats.disagreed,
+                    "errored": stats.errored,
+                    "flipped_allow_to_deny": stats.flipped_allow_to_deny,
+                    "flipped_deny_to_allow": stats.flipped_deny_to_allow,
+                    "labels": stats.labels,
+                    "fixed": stats.fixed,
+                    "regressed": stats.regressed,
+                },
+                "results": [
+                    {
+                        "seq": r.case.seq,
+                        "hash": r.case.record_hash,
+                        "trajectory_id": r.case.envelope.trajectory_id,
+                        "tool_name": r.case.envelope.tool_name,
+                        "original_allowed": r.case.envelope.decision_allowed,
+                        "agreement": r.agreement.value,
+                        "new_allowed": (
+                            r.new_decision.allowed
+                            if r.new_decision is not None else None
+                        ),
+                        "new_reason": (
+                            r.new_decision.reason
+                            if r.new_decision is not None else None
+                        ),
+                        "error": r.error,
+                        "label": proxy._label_store.get(
+                            r.case.seq, r.case.record_hash,
+                        ).value,
+                    }
+                    for r in results
+                ],
             }
 
         @app.get("/v1/metrics/guardrail")

@@ -173,9 +173,11 @@ class MeshProxy:
     # destructive_guard_override field.
     enable_destructive_guard: bool = True
 
-    # Supply chain attack scanner (package install commands, manifests)
+    # Supply chain attack scanner (package install commands, manifests).
+    # Uses the Scanner protocol from tessera.scanners. Severity threshold
+    # follows the scanner's own default ("high") unless overridden in the
+    # SupplyChainScanner constructor by a downstream composer.
     enable_supply_chain_scanner: bool = True
-    supply_chain_block_severity: str = "block"  # "block" or "warn"
 
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
@@ -203,6 +205,8 @@ class MeshProxy:
     _hwm: Any = field(default=None, init=False, repr=False)
     _outbound_policy: Any = field(default=None, init=False, repr=False)
     _destructive_guard: Any = field(default=None, init=False, repr=False)
+    _supply_chain_scanner: Any = field(default=None, init=False, repr=False)
+    _yara_scanner: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -385,6 +389,14 @@ class MeshProxy:
         from tessera.destructive_guard import DestructiveGuard
         self._destructive_guard = DestructiveGuard()
 
+        # 23. Supply chain scanner (always instantiated; gated by flag)
+        from tessera.scanners.supply_chain import SupplyChainScanner
+        self._supply_chain_scanner = SupplyChainScanner()
+
+        # 24. YARA scanner (lazy import; available=False if yara-x not installed)
+        from tessera.scanners.yara import YaraScanner
+        self._yara_scanner = YaraScanner()
+
     # ------------------------------------------------------------------
     # Core evaluation pipeline
     # ------------------------------------------------------------------
@@ -445,22 +457,14 @@ class MeshProxy:
                 ))
                 return False, dguard_result.primary_reason
 
-        # 2c. Supply chain attack scanner (install commands, manifests)
+        # 2c. Supply chain attack scanner (Scanner protocol)
         if self.enable_supply_chain_scanner and args:
-            from tessera.scanners.supply_chain import (
-                SupplyChainSeverity, check_supply_chain,
+            sc_result = self._supply_chain_scanner.scan(
+                tool_name=tool_name, args=args, trajectory_id=session_id,
             )
-            combined = "\n".join(
-                str(v) for v in args.values() if isinstance(v, (str, bytes))
-            )
-            sc_result = check_supply_chain(combined)
-            block_sc_warn = self.supply_chain_block_severity.lower() == "warn"
-            if sc_result.detected and (
-                sc_result.should_block
-                or (block_sc_warn and sc_result.max_severity == SupplyChainSeverity.WARN)
-            ):
+            if not sc_result.allowed:
                 from tessera.events import EventKind, SecurityEvent, emit
-                top = sc_result.matches[0]
+                top = sc_result.findings[0]
                 emit(SecurityEvent.now(
                     kind=EventKind.POLICY_DENY,
                     principal=agent_identity or self.principal,
@@ -468,15 +472,36 @@ class MeshProxy:
                         "check": "supply_chain",
                         "tool": tool_name,
                         "rule_id": top.rule_id,
-                        "category": top.category,
-                        "severity": top.severity.value,
-                        "description": top.description,
-                        "matched_text": top.matched_text[:120],
+                        "severity": top.severity,
+                        "message": top.message,
+                        "arg_path": top.arg_path,
+                        "evidence": top.evidence[:120],
+                        "metadata": top.metadata,
                     },
                 ))
-                return False, (
-                    f"supply chain risk: {top.rule_id} ({top.description})"
-                )
+                return False, sc_result.primary_reason
+
+        # 2d. YARA scanner (no-op when yara-x not installed or no rules loaded)
+        if self._yara_scanner is not None and self._yara_scanner.available and args:
+            yara_result = self._yara_scanner.scan(
+                tool_name=tool_name, args=args, trajectory_id=session_id,
+            )
+            if not yara_result.allowed:
+                from tessera.events import EventKind, SecurityEvent, emit
+                top = yara_result.findings[0]
+                emit(SecurityEvent.now(
+                    kind=EventKind.POLICY_DENY,
+                    principal=agent_identity or self.principal,
+                    detail={
+                        "check": "yara",
+                        "tool": tool_name,
+                        "rule_id": top.rule_id,
+                        "severity": top.severity,
+                        "message": top.message,
+                        "arg_path": top.arg_path,
+                    },
+                ))
+                return False, yara_result.primary_reason
 
         # 3. Delegation token verification (if provided)
         delegation = None
@@ -1263,23 +1288,24 @@ class MeshProxy:
         @app.post("/v1/supply-chain/check")
         def api_supply_chain_check(body: _ScanRequest):
             """Scan a command or manifest for supply chain attack patterns."""
-            from tessera.scanners.supply_chain import check_supply_chain
-            result = check_supply_chain(body.text)
+            result = proxy._supply_chain_scanner.scan(
+                tool_name=body.tool_name or "raw",
+                args=body.text,
+            )
             return {
-                "detected": result.detected,
-                "should_block": result.should_block,
-                "max_severity": (
-                    result.max_severity.value if result.max_severity else None
-                ),
-                "matches": [
+                "allowed": result.allowed,
+                "primary_reason": result.primary_reason,
+                "max_severity": result.max_severity,
+                "findings": [
                     {
-                        "rule_id": m.rule_id,
-                        "severity": m.severity.value,
-                        "category": m.category,
-                        "description": m.description,
-                        "matched_text": m.matched_text,
+                        "rule_id": f.rule_id,
+                        "severity": f.severity,
+                        "message": f.message,
+                        "arg_path": f.arg_path,
+                        "evidence": f.evidence,
+                        "metadata": f.metadata,
                     }
-                    for m in result.matches
+                    for f in result.findings
                 ],
             }
 

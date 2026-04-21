@@ -4,14 +4,14 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentmesh-mesh"
-version = "0.5.0"
+version = "0.6.0"
 description = "Agent security mesh: 27-endpoint proxy + 12 framework SDKs + coding-agent hooks, composing 54 Tessera modules with SPIRE, agentgateway, and OpenTelemetry."
 requires-python = ">=3.12"
 license = { text = "AGPL-3.0-or-later" }
 readme = "README.md"
 authors = [{ name = "Kenith Philip" }]
 dependencies = [
-    "tessera-mesh>=0.5.0",
+    "tessera-mesh>=0.6.0",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pyyaml>=6.0",

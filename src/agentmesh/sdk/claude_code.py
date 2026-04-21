@@ -1,24 +1,45 @@
-"""Claude Code hook adapter backed by the AgentMesh proxy.
+"""agentmesh.sdk.claude_code
 
-Claude Code hooks are stdin/stdout JSON protocols. A hook binary reads
-a JSON event from stdin, makes a decision, and writes a JSON response
-to stdout. This module provides a reusable handler that maps Claude
-Code events to AgentMesh proxy endpoints.
+Adapter for Anthropic Claude Code's PreToolUse / PostToolUse hooks.
 
-Register as a PreToolUse, PostToolUse, or UserPromptSubmit hook::
+Hook schema (stdin JSON)::
 
-    # ~/.claude/settings.json
+    {
+      "session_id": "abc123",
+      "transcript_path": "/path/to/transcript.json",
+      "cwd": "/workspace",
+      "hook_event_name": "PreToolUse",
+      "tool_name": "Bash",
+      "tool_input": { "command": "ls -la" }
+    }
+
+Response: Claude Code accepts either an exit code + stderr, or a JSON
+object on stdout describing the decision. We emit both, so older and
+newer Claude Code versions both work. For a deny we exit 2 (the
+Claude Code convention for "block with reason") AND print
+``{"decision": "block", "reason": "..."}`` on stdout.
+
+Install in ``.claude/settings.json``::
+
     {
       "hooks": {
-        "PreToolUse": [{"type": "command", "command": "python -m agentmesh.sdk.claude_code pre"}],
-        "PostToolUse": [{"type": "command", "command": "python -m agentmesh.sdk.claude_code post"}],
-        "UserPromptSubmit": [{"type": "command", "command": "python -m agentmesh.sdk.claude_code prompt"}]
+        "PreToolUse": [
+          {
+            "matcher": "*",
+            "hooks": [
+              {"type": "command",
+               "command": "python -m agentmesh.sdk.claude_code"}
+            ]
+          }
+        ]
       }
     }
 
-Run `python -m agentmesh.sdk.claude_code --help` for CLI options.
+Environment::
 
-Reference: https://code.claude.com/docs/en/hooks
+    AGENTMESH_ENDPOINT=http://localhost:9090   # required for HTTP mode
+    AGENTMESH_API_KEY=...                       # optional
+    TESSERA_FAIL_OPEN=0|1                       # default 0 (fail-closed)
 """
 
 from __future__ import annotations
@@ -26,137 +47,70 @@ from __future__ import annotations
 import json
 import os
 import sys
-from typing import Any
+from typing import Any, Mapping
 
-from agentmesh.client import MeshClient
-
-
-def _mesh_client() -> MeshClient:
-    return MeshClient(
-        base_url=os.environ.get("AGENTMESH_PROXY_URL", "http://localhost:9090"),
-        session_id=os.environ.get("AGENTMESH_SESSION_ID", "claude-code"),
-    )
+from agentmesh.sdk import (
+    AgentHookAdapter,
+    EvaluationResult,
+    HTTPEvaluator,
+    ToolCallEnvelope,
+)
 
 
-def _trim(s: Any, n: int = 5000) -> str:
-    return str(s)[:n]
+class ClaudeCodeAdapter(AgentHookAdapter):
+    agent_name = "claude-code"
 
+    def normalize_input(self, raw: Mapping[str, Any]) -> ToolCallEnvelope:
+        tool_input = raw.get("tool_input")
+        if not isinstance(tool_input, dict):
+            tool_input = {"_raw": tool_input} if tool_input is not None else {}
+        return ToolCallEnvelope(
+            trajectory_id=str(raw.get("session_id") or ""),
+            tool_name=str(raw.get("tool_name") or ""),
+            args=tool_input,
+            agent_event=str(raw.get("hook_event_name") or "PreToolUse"),
+            raw=dict(raw),
+        )
 
-def _emit(obj: dict[str, Any]) -> None:
-    """Emit a Claude Code hook JSON response to stdout."""
-    sys.stdout.write(json.dumps(obj))
-    sys.stdout.write("\n")
-    sys.stdout.flush()
-
-
-def handle_pre_tool_use(event: dict[str, Any]) -> dict[str, Any]:
-    """PreToolUse hook: evaluate policy before tool execution.
-
-    Claude Code sends ``tool_name`` and ``tool_input`` in the event.
-    We call ``/v1/evaluate`` on the proxy. If denied, return a
-    Claude-Code-shaped deny response that blocks the call and shows
-    the reason to the model.
-    """
-    tool_name = event.get("tool_name", "unknown")
-    tool_input = event.get("tool_input", {})
-    client = _mesh_client()
-    allowed, reason = client.evaluate(tool_name, tool_input)
-    if not allowed:
-        return {
-            "hookSpecificOutput": {
-                "hookEventName": "PreToolUse",
-                "permissionDecision": "deny",
-                "permissionDecisionReason": f"AgentMesh: {reason}",
+    def format_response(
+        self,
+        env: ToolCallEnvelope,
+        result: EvaluationResult,
+    ) -> tuple[int, str, str]:
+        if result.allowed:
+            # Silent allow: Claude Code treats exit 0 + empty stdout as proceed.
+            return 0, "", ""
+        reason = result.reason or f"blocked by {result.source}"
+        payload = {
+            "decision": "block",
+            "reason": reason,
+            "metadata": {
+                "source": result.source,
+                **result.metadata,
             },
         }
-    return {
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "permissionDecision": "allow",
-        },
-    }
+        return (
+            2,
+            json.dumps(payload),
+            f"[agentmesh] blocked {env.tool_name}: {reason}",
+        )
 
 
-def handle_post_tool_use(event: dict[str, Any]) -> dict[str, Any]:
-    """PostToolUse hook: label tool output in the mesh context.
-
-    Claude Code sends ``tool_name`` and ``tool_response`` with the
-    output. We call ``/v1/label`` so the proxy can scan and taint the
-    context for subsequent tool calls.
-    """
-    tool_name = event.get("tool_name", "unknown")
-    # Claude Code puts the result under different keys depending on the
-    # tool. Handle the common shapes.
-    response = event.get("tool_response") or event.get("output") or ""
-    if isinstance(response, dict):
-        response = response.get("content", response.get("text", str(response)))
-    client = _mesh_client()
-    client.label(tool_name, _trim(response))
-    return {}
-
-
-def handle_user_prompt(event: dict[str, Any]) -> dict[str, Any]:
-    """UserPromptSubmit hook: seed the proxy context with the prompt.
-
-    Also runs prompt screening. If the prompt fails screening, return
-    a warning in the hook response so Claude Code can show it.
-    """
-    prompt = event.get("prompt") or event.get("user_prompt") or ""
-    client = _mesh_client()
-    client.add_prompt(_trim(prompt, 1000))
-    return {}
-
-
-def handle_session_start(event: dict[str, Any]) -> dict[str, Any]:
-    """SessionStart hook: reset the proxy context for a new session."""
-    client = _mesh_client()
-    client.reset()
-    return {}
-
-
-def main(argv: list[str] | None = None) -> int:
-    """CLI entry point.
-
-    Reads a Claude Code hook event from stdin, dispatches based on the
-    hook type in argv[1], and writes the response to stdout.
-    """
-    argv = argv or sys.argv
-    if len(argv) < 2:
-        sys.stderr.write("usage: claude_code <pre|post|prompt|session>\n")
-        return 2
-
-    hook_type = argv[1].lower()
-    try:
-        event = json.loads(sys.stdin.read())
-    except json.JSONDecodeError as e:
-        sys.stderr.write(f"bad JSON on stdin: {e}\n")
-        return 1
-
-    handlers = {
-        "pre": handle_pre_tool_use,
-        "post": handle_post_tool_use,
-        "prompt": handle_user_prompt,
-        "session": handle_session_start,
-    }
-    handler = handlers.get(hook_type)
-    if handler is None:
-        sys.stderr.write(f"unknown hook type: {hook_type}\n")
-        return 2
-
-    try:
-        response = handler(event)
-    except Exception as e:
-        # Fail open: on any error, let the tool call proceed. The
-        # mesh has other layers (taint tracking, human approval) that
-        # catch attacks; failing closed on a proxy error would break
-        # every session.
-        sys.stderr.write(f"agentmesh hook error: {e}\n")
+def main() -> int:
+    endpoint = os.environ.get("AGENTMESH_ENDPOINT")
+    if not endpoint:
+        print(
+            "[agentmesh] AGENTMESH_ENDPOINT not set; allowing "
+            "(configure to enforce)",
+            file=sys.stderr,
+        )
         return 0
+    evaluator = HTTPEvaluator(
+        endpoint=endpoint,
+        api_key=os.environ.get("AGENTMESH_API_KEY"),
+    )
+    return ClaudeCodeAdapter(evaluator).run_stdio()
 
-    if response:
-        _emit(response)
-    return 0
 
-
-if __name__ == "__main__":
-    sys.exit(main())
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit(main())

@@ -109,6 +109,10 @@ class _ClassifyRequest(BaseModel):
     trajectory_id: str | None = None
 
 
+class _SSRFCheckRequest(BaseModel):
+    url: str
+
+
 class _LabelRequest(BaseModel):
     seq: int
     hash: str
@@ -204,6 +208,13 @@ class MeshProxy:
     # SupplyChainScanner constructor by a downstream composer.
     enable_supply_chain_scanner: bool = True
 
+    # SSRF guard. Blocks outbound URLs that resolve to RFC1918,
+    # loopback, link-local, cloud metadata, or non-http(s) schemes.
+    # Optional allowlist mode tightens to deny-by-default.
+    enable_ssrf_guard: bool = True
+    ssrf_blocked_hostnames: list[str] = field(default_factory=list)
+    ssrf_allowlist_hostnames: list[str] | None = None
+
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
     _context: Context = field(default_factory=Context, init=False, repr=False)
@@ -232,6 +243,7 @@ class MeshProxy:
     _destructive_guard: Any = field(default=None, init=False, repr=False)
     _supply_chain_scanner: Any = field(default=None, init=False, repr=False)
     _yara_scanner: Any = field(default=None, init=False, repr=False)
+    _ssrf_guard: Any = field(default=None, init=False, repr=False)
     _audit_sink: Any = field(default=None, init=False, repr=False)
     _label_store: Any = field(default=None, init=False, repr=False)
 
@@ -451,6 +463,16 @@ class MeshProxy:
         from tessera.scanners.yara import YaraScanner
         self._yara_scanner = YaraScanner()
 
+        # 25. SSRF guard. Always instantiated; gated by flag at the call
+        # site. Uses the default socket-based resolver so hostnames are
+        # resolved before the CIDR check, which is the only way to catch
+        # DNS-rebinding-style payloads.
+        from tessera.ssrf_guard import SSRFGuard
+        self._ssrf_guard = SSRFGuard(
+            blocked_hostnames=self.ssrf_blocked_hostnames,
+            allowlist_hostnames=self.ssrf_allowlist_hostnames,
+        )
+
     # ------------------------------------------------------------------
     # Core evaluation pipeline
     # ------------------------------------------------------------------
@@ -534,6 +556,33 @@ class MeshProxy:
                     },
                 ))
                 return False, sc_result.primary_reason
+
+        # 2c-2. SSRF guard. Walks args for URL-shaped strings, resolves
+        # hostnames, denies if anything resolves to private space, cloud
+        # metadata, or non-http(s) schemes. Cheap when no URLs appear in
+        # args (regex pre-filter); pays DNS only when one does.
+        if self.enable_ssrf_guard and args:
+            ssrf_result = self._ssrf_guard.scan(
+                tool_name=tool_name, args=args, trajectory_id=session_id,
+            )
+            if not ssrf_result.allowed:
+                from tessera.events import EventKind, SecurityEvent, emit
+                top = ssrf_result.findings[0]
+                emit(SecurityEvent.now(
+                    kind=EventKind.POLICY_DENY,
+                    principal=agent_identity or self.principal,
+                    detail={
+                        "check": "ssrf_guard",
+                        "tool": tool_name,
+                        "rule_id": top.rule_id,
+                        "severity": top.severity,
+                        "message": top.message,
+                        "arg_path": top.arg_path,
+                        "evidence": top.evidence[:200],
+                        "metadata": top.metadata,
+                    },
+                ))
+                return False, ssrf_result.primary_reason
 
         # 2d. YARA scanner (no-op when yara-x not installed or no rules loaded)
         if self._yara_scanner is not None and self._yara_scanner.available and args:
@@ -1623,6 +1672,32 @@ class MeshProxy:
                         "arg_path": f.arg_path,
                         "evidence": f.evidence,
                         "metadata": f.metadata,
+                    }
+                    for f in result.findings
+                ],
+            }
+
+        @app.post("/v1/ssrf/check")
+        def api_ssrf_check(body: _SSRFCheckRequest):
+            """Check a single URL against the SSRF guard.
+
+            Returns the verdict plus all findings (cloud metadata,
+            private IP, scheme, etc.). Hostnames are resolved before
+            the CIDR check, so DNS-rebinding-style payloads that
+            ultimately point at internal IPs are caught.
+            """
+            result = proxy._ssrf_guard.check_url(body.url)
+            return {
+                "allowed": result.allowed,
+                "primary_reason": result.primary_reason,
+                "findings": [
+                    {
+                        "rule_id": f.rule_id,
+                        "category": f.category,
+                        "message": f.message,
+                        "url": f.url,
+                        "resolved_ip": f.resolved_ip,
+                        "arg_path": f.arg_path,
                     }
                     for f in result.findings
                 ],

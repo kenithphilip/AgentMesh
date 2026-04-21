@@ -151,6 +151,13 @@ class MeshProxy:
     enable_canary_tokens: bool = False
     cel_rules_path: str | None = None
 
+    # Persistent hash-chained audit log (JSONL). Opt-in via path.
+    # When seal_key is set, a companion .seal file is written with an
+    # HMAC over (seq, last_hash) so truncation is detectable.
+    audit_log_path: str | None = None
+    audit_log_seal_key: bytes | None = None
+    audit_log_fsync_every: int = 1
+
     # Tier A+B: identity, transport, exports
     trust_domain: str = "agentmesh.local"
     spire_socket: str | None = None
@@ -207,6 +214,7 @@ class MeshProxy:
     _destructive_guard: Any = field(default=None, init=False, repr=False)
     _supply_chain_scanner: Any = field(default=None, init=False, repr=False)
     _yara_scanner: Any = field(default=None, init=False, repr=False)
+    _audit_sink: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -257,6 +265,19 @@ class MeshProxy:
         from tessera.events import register_sink
         self._audit_log = ChainedAuditLog()
         register_sink(self._audit_log)
+
+        # 5b. Persistent hash-chained audit log (opt-in via audit_log_path).
+        # This is the durable record for replay and forensic verification.
+        # The in-memory ChainedAuditLog above is kept for backward-compat
+        # callers that query the chain via self.audit_chain_valid.
+        if self.audit_log_path:
+            from tessera.audit_log import JSONLHashchainSink
+            self._audit_sink = JSONLHashchainSink(
+                self.audit_log_path,
+                fsync_every=self.audit_log_fsync_every,
+                seal_key=self.audit_log_seal_key,
+            )
+            register_sink(self._audit_sink)
 
         # 6. Initialize tool definition tracker (rug-pull detection)
         from tessera.mcp_allowlist import ToolDefinitionTracker
@@ -1234,6 +1255,41 @@ class MeshProxy:
         def api_evidence():
             """Export signed evidence bundle from event buffer."""
             return proxy.export_evidence()
+
+        @app.get("/v1/audit/verify")
+        def api_audit_verify():
+            """Verify the hash-chained audit log end-to-end.
+
+            Walks the configured ``audit_log_path``. If a ``seal_key``
+            was configured at startup the companion .seal file is also
+            checked (truncation detection).
+
+            Returns 404-shaped JSON when no persistent log is configured
+            so operators can distinguish "not configured" from "empty file."
+            """
+            if proxy._audit_sink is None:
+                return {
+                    "configured": False,
+                    "path": None,
+                    "valid": None,
+                    "records_checked": 0,
+                }
+            from tessera.audit_log import verify_chain
+            result = verify_chain(
+                proxy.audit_log_path,
+                seal_key=proxy.audit_log_seal_key,
+            )
+            return {
+                "configured": True,
+                "path": proxy.audit_log_path,
+                "valid": result.valid,
+                "records_checked": result.records_checked,
+                "first_bad_seq": result.first_bad_seq,
+                "reason": result.reason,
+                "seal_valid": result.seal_valid,
+                "last_seq": proxy._audit_sink.last_seq,
+                "last_hash": proxy._audit_sink.last_hash,
+            }
 
         @app.get("/v1/metrics/guardrail")
         def api_guardrail_metrics():

@@ -97,7 +97,24 @@ OpenAPI docs available at `/docs` when the proxy is running.
 
 ## Framework SDK
 
-Drop-in adapters that call the proxy instead of running Tessera in-process:
+Drop-in adapters for 10 frameworks that call the proxy instead of
+running Tessera in-process:
+
+| Framework        | Module                       | Class                   |
+|------------------|------------------------------|-------------------------|
+| LangChain        | `agentmesh.sdk.langchain`    | `MeshCallbackHandler`   |
+| OpenAI Agents    | `agentmesh.sdk.openai_agents`| `MeshAgentHooks`        |
+| CrewAI           | `agentmesh.sdk.crewai`       | `MeshCrewCallback`      |
+| Google ADK       | `agentmesh.sdk.google_adk`   | `MeshADKCallbacks`      |
+| LlamaIndex       | `agentmesh.sdk.llamaindex`   | `MeshLlamaIndexHandler` |
+| LangGraph        | `agentmesh.sdk.langgraph`    | `MeshLangGraphGuard`    |
+| Haystack         | `agentmesh.sdk.haystack`     | `MeshHaystackGuard`     |
+| PydanticAI       | `agentmesh.sdk.pydantic_ai`  | `MeshPydanticAIGuard`   |
+| NeMo Guardrails  | `agentmesh.sdk.nemo`         | `MeshRailAction`        |
+| AgentDojo        | `agentmesh.sdk.agentdojo`    | `MeshToolLabeler` + `MeshToolGuard` |
+| Any framework    | `agentmesh.sdk.generic`      | `MeshGuard`             |
+
+Examples:
 
 ```python
 # LangChain
@@ -105,19 +122,19 @@ from agentmesh.sdk.langchain import MeshCallbackHandler
 handler = MeshCallbackHandler(proxy_url="http://localhost:9090")
 chain = agent.with_config(callbacks=[handler])
 
-# OpenAI Agents
-from agentmesh.sdk.openai_agents import MeshAgentHooks
-agent = Agent(name="travel", hooks=MeshAgentHooks())
+# LlamaIndex
+from agentmesh.sdk.llamaindex import MeshLlamaIndexHandler
+from llama_index.core.callbacks import CallbackManager
+handler = MeshLlamaIndexHandler(proxy_url="http://localhost:9090")
+Settings.callback_manager = CallbackManager([handler])
 
-# CrewAI
-from agentmesh.sdk.crewai import MeshCrewCallback
-callback = MeshCrewCallback(proxy_url="http://localhost:9090")
+# LangGraph (node functions, not callbacks)
+from agentmesh.sdk.langgraph import MeshLangGraphGuard
+guard = MeshLangGraphGuard(proxy_url="http://localhost:9090")
+graph.add_node("check_tool", guard.check_tool_call)
+graph.add_node("label_output", guard.label_tool_output)
 
-# Google ADK
-from agentmesh.sdk.google_adk import MeshADKCallbacks
-callbacks = MeshADKCallbacks(proxy_url="http://localhost:9090")
-
-# Any framework
+# Any framework (manual control)
 from agentmesh.sdk.generic import MeshGuard
 with MeshGuard() as guard:
     guard.start_session("Find hotels and email me the best one")

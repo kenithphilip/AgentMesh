@@ -146,6 +146,29 @@ AgentMesh Proxy (23 endpoints, 51 Tessera modules)
 Upstream MCP server (agentgateway or direct)
 ```
 
+## Performance
+
+Measured on Apple M-series, FastAPI TestClient (in-process), 2,000 iterations
+per endpoint per config.
+
+| Endpoint | Minimal p50 | Default p50 | Full p50 |
+|----------|-------------|-------------|----------|
+| `GET /healthz` | 903us | 959us | 965us |
+| `POST /v1/evaluate` (clean) | 1.35ms | **1.42ms** | 1.41ms |
+| `POST /v1/evaluate` (blocked by taint) | 4.37ms | 4.58ms | 5.27ms |
+| `POST /v1/scan` (clean text) | 1.94ms | 2.14ms | 2.20ms |
+| `POST /v1/scan` (tainted text) | 8.41ms | 8.55ms | 8.66ms |
+| `POST /v1/label` (adds to context) | 3.23ms | 3.28ms | 3.90ms |
+| `GET /v1/context` | 3.57ms | 3.98ms | 4.02ms |
+
+Feature overhead is small. Default vs minimal adds **77us p50** to the
+evaluate pipeline (+6%). Full config adds 73us (+5%). The scanner cost
+on tainted text (8.5ms) is the fixed work of running the sliding-window
+injection detector, which is unaffected by feature flags.
+
+Headline: **AgentMesh adds ~1.4ms p50 and ~2.1ms p99 per tool call** at
+the default configuration. Reproduce with `python benchmarks/bench_proxy.py`.
+
 ## Defense layers
 
 1. **Prompt screening** before context entry (delegated injection defense)

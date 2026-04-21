@@ -1056,6 +1056,10 @@ class MeshProxy:
                 "context_segments": len(proxy._context.segments),
                 "min_trust": int(proxy._context.min_trust),
                 "guardrail_enabled": proxy._guardrail is not None,
+                "guardrail_breaker": (
+                    proxy._guardrail.stats.get("breaker")
+                    if proxy._guardrail is not None else None
+                ),
                 "identity_required": proxy.require_identity,
                 "rate_limiter_active": proxy._rate_limiter is not None,
                 "mcp_allowlist_active": proxy._mcp_allowlist is not None,
@@ -1230,6 +1234,19 @@ class MeshProxy:
         def api_evidence():
             """Export signed evidence bundle from event buffer."""
             return proxy.export_evidence()
+
+        @app.get("/v1/metrics/guardrail")
+        def api_guardrail_metrics():
+            """LLM guardrail call, cache, and circuit-breaker metrics.
+
+            Operators should alert when ``breaker.state != "closed"`` or
+            ``breaker.total_opens`` rises. ``skipped_by_breaker`` growing
+            without ``breaker.state`` reporting open means half-open
+            probes are failing; investigate upstream before re-enabling.
+            """
+            if proxy._guardrail is None:
+                return {"enabled": False}
+            return {"enabled": True, **proxy._guardrail.stats}
 
         @app.post("/v1/approve")
         def api_approve(body: _ApprovalRequest):

@@ -104,6 +104,11 @@ class _HeartbeatRequest(BaseModel):
     agent_id: str
 
 
+class _ClassifyRequest(BaseModel):
+    content: str
+    trajectory_id: str | None = None
+
+
 @dataclass
 class MeshProxy:
     """AgentMesh MCP proxy with full enterprise defense stack.
@@ -156,12 +161,17 @@ class MeshProxy:
     enable_xds_server: bool = False
 
     # Sensitivity labels and information flow control
+    # Trajectory-keyed high-water-mark model. Pass an outbound_tool_registry
+    # mapping tool_name -> (outbound, max_sensitivity) to enforce IFC.
+    # When enabled without a registry, unknown tools default to inbound/local.
     enable_sensitivity_labeling: bool = False
-    outbound_tool_patterns: list[str] = field(default_factory=list)
+    outbound_tool_registry: dict[str, dict[str, Any]] = field(default_factory=dict)
 
-    # Destructive operation guard (explicit pattern deny-list)
+    # Destructive operation guard (explicit pattern deny-list).
+    # Every pattern is a hard deny with a stable rule_id in the audit log.
+    # To tighten or loosen, pass a custom DestructiveGuard via the
+    # destructive_guard_override field.
     enable_destructive_guard: bool = True
-    destructive_guard_block_severity: str = "block"  # "block" or "warn"
 
     # Supply chain attack scanner (package install commands, manifests)
     enable_supply_chain_scanner: bool = True
@@ -189,7 +199,10 @@ class MeshProxy:
     _session_store: Any = field(default=None, init=False, repr=False)
     _evidence_buffer: Any = field(default=None, init=False, repr=False)
     _cooldown: Any = field(default=None, init=False, repr=False)
-    _sensitivity: Any = field(default=None, init=False, repr=False)
+    _classifier: Any = field(default=None, init=False, repr=False)
+    _hwm: Any = field(default=None, init=False, repr=False)
+    _outbound_policy: Any = field(default=None, init=False, repr=False)
+    _destructive_guard: Any = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -342,10 +355,35 @@ class MeshProxy:
         from tessera.risk.cooldown import CooldownEscalator
         self._cooldown = CooldownEscalator()
 
-        # 21. Sensitivity context for information flow control
-        if self.enable_sensitivity_labeling:
-            from tessera.sensitivity import SensitivityContext
-            self._sensitivity = SensitivityContext()
+        # 21. Sensitivity + IFC: classifier, high-water mark, outbound policy.
+        # These are independent of enable_sensitivity_labeling; the flag only
+        # controls auto-classification in scan_and_label. The /v1/sensitivity
+        # endpoints always work.
+        from tessera.sensitivity import (
+            HighWaterMark,
+            OutboundPolicy,
+            SensitivityClassifier,
+            SensitivityLabel,
+            ToolClassification,
+        )
+        self._classifier = SensitivityClassifier()
+        self._hwm = HighWaterMark()
+
+        # Build OutboundPolicy registry from config dict.
+        # Expected shape: {"tool_name": {"outbound": bool, "max_sensitivity": "INTERNAL"}}
+        registry = {}
+        for tool, cfg in self.outbound_tool_registry.items():
+            registry[tool] = ToolClassification(
+                outbound=bool(cfg.get("outbound", False)),
+                max_sensitivity=SensitivityLabel.from_str(
+                    cfg.get("max_sensitivity", "INTERNAL")
+                ),
+            )
+        self._outbound_policy = OutboundPolicy(registry=registry)
+
+        # 22. Destructive guard (always instantiated; gated by flag at call site)
+        from tessera.destructive_guard import DestructiveGuard
+        self._destructive_guard = DestructiveGuard()
 
     # ------------------------------------------------------------------
     # Core evaluation pipeline
@@ -385,30 +423,27 @@ class MeshProxy:
         if not allowed:
             return False, f"rate limit: {reason}"
 
-        # 2b. Destructive operation guard (explicit pattern deny-list)
+        # 2b. Destructive operation guard. Runs first so audit logs show
+        # the explicit pattern_id rather than a scanner threshold.
         if self.enable_destructive_guard and args:
-            from tessera.destructive_guard import Severity, check_tool_args
-            dguard = check_tool_args(args)
-            block_at_warn = self.destructive_guard_block_severity.lower() == "warn"
-            if dguard.destructive and (dguard.should_block or (block_at_warn and dguard.max_severity == Severity.WARN)):
+            dguard_result = self._destructive_guard.check(tool_name, args)
+            if not dguard_result.allowed:
                 from tessera.events import EventKind, SecurityEvent, emit
-                top_match = dguard.matches[0]
+                top_match = dguard_result.matches[0]
                 emit(SecurityEvent.now(
                     kind=EventKind.POLICY_DENY,
                     principal=agent_identity or self.principal,
                     detail={
                         "check": "destructive_guard",
                         "tool": tool_name,
-                        "rule_id": top_match.rule_id,
-                        "severity": top_match.severity.value,
+                        "pattern_id": top_match.pattern_id,
+                        "category": top_match.category,
                         "description": top_match.description,
+                        "arg_path": top_match.arg_path,
                         "matched_text": top_match.matched_text[:120],
                     },
                 ))
-                return False, (
-                    f"destructive operation blocked: {top_match.rule_id} "
-                    f"({top_match.description})"
-                )
+                return False, dguard_result.primary_reason
 
         # 2c. Supply chain attack scanner (install commands, manifests)
         if self.enable_supply_chain_scanner and args:
@@ -556,23 +591,13 @@ class MeshProxy:
             if toxic.toxic:
                 return False, f"toxic flow: {toxic.reason}"
 
-        # 11b. Information flow control: block outbound when trajectory
-        # carries confidential data (Bell-LaPadula no-write-down)
-        if self._sensitivity is not None:
-            from tessera.sensitivity import check_outbound
+        # 11b. Information flow control: OutboundPolicy is a pure read of
+        # the trajectory HWM. The HWM is populated by /v1/sensitivity/classify
+        # or scan_and_label. A deny here is reproducible from audit data.
+        if self.enable_sensitivity_labeling and self._outbound_policy is not None:
             from tessera.events import EventKind, SecurityEvent, emit
-            has_untrusted = any(
-                s.label.trust_level < TrustLevel.USER
-                for s in self._context.segments
-            )
-            patterns = tuple(self.outbound_tool_patterns) or None
-            kwargs = {"outbound_patterns": patterns} if patterns else {}
-            ifc_decision = check_outbound(
-                tool_name,
-                self._sensitivity.max_sensitivity,
-                has_injection=has_untrusted,
-                **kwargs,
-            )
+            hwm = self._hwm.get(session_id)
+            ifc_decision = self._outbound_policy.check(tool_name, hwm)
             if not ifc_decision.allowed:
                 emit(SecurityEvent.now(
                     kind=EventKind.POLICY_DENY,
@@ -580,7 +605,8 @@ class MeshProxy:
                     detail={
                         "check": "ifc_outbound",
                         "tool": tool_name,
-                        "sensitivity": ifc_decision.sensitivity.name,
+                        "hwm": ifc_decision.hwm.name,
+                        "tool_max": ifc_decision.tool_max.name,
                         "reason": ifc_decision.reason,
                     },
                 ))
@@ -603,6 +629,7 @@ class MeshProxy:
         tool_name: str,
         output_text: str,
         raw_output: Any = None,
+        session_id: str = "default",
     ) -> tuple[str, TrustLevel]:
         """Scan tool output, label, and add to context.
 
@@ -652,23 +679,27 @@ class MeshProxy:
             from tessera.redaction import redact_nested
             output_text, redacted = redact_nested(output_text, self._secret_registry)
 
-        # -- Phase 1a: sensitivity classification (IFC high-water mark) --
+        # -- Phase 1a: sensitivity classification -> HWM update --
         # Runs before PII redaction so the classifier sees the raw patterns
-        # (SSN, keys, etc.) that drive HIGHLY_CONFIDENTIAL.
-        if self._sensitivity is not None:
+        # (SSN, keys, etc.) that drive RESTRICTED. Auto-classification is
+        # gated on enable_sensitivity_labeling so the flag has a single
+        # clear meaning: "automatically observe tool outputs into the HWM".
+        # Explicit classification via /v1/sensitivity/classify always works.
+        if self.enable_sensitivity_labeling and self._classifier is not None:
             from tessera.events import EventKind, SecurityEvent, emit
             from tessera.sensitivity import SensitivityLabel
-            classification = self._sensitivity.observe(output_text)
+            classification = self._classifier.classify(output_text)
             if classification.label > SensitivityLabel.PUBLIC:
+                self._hwm.observe(session_id, classification.label)
                 emit(SecurityEvent.now(
                     kind=EventKind.CONTENT_INJECTION_DETECTED,
                     principal=self.principal,
                     detail={
                         "scanner": "sensitivity",
                         "tool_name": tool_name,
-                        "sensitivity": classification.label.name,
-                        "matched_patterns": list(classification.matched_patterns),
-                        "confidence": classification.score,
+                        "session_id": session_id,
+                        "label": classification.label.name,
+                        "matched_rule_ids": list(classification.matched_rule_ids),
                     },
                 ))
 
@@ -949,7 +980,13 @@ class MeshProxy:
         if self._secret_registry is not None:
             self._secret_registry.add(name, value)
 
-    def reset_context(self) -> None:
+    def reset_context(self, session_id: str = "default") -> None:
+        """Reset per-session state.
+
+        Clears the Tessera Context (shared across sessions in this simple
+        proxy) and resets the sensitivity HWM for the given session.
+        Multi-tenant proxies should key Context per session too.
+        """
         self._context = Context()
         if self._accumulator is not None:
             from tessera.taint import DependencyAccumulator
@@ -957,8 +994,8 @@ class MeshProxy:
         if self._risk_forecaster is not None:
             from tessera.risk.forecaster import SessionRiskForecaster
             self._risk_forecaster = SessionRiskForecaster()
-        if self._sensitivity is not None:
-            self._sensitivity.reset()
+        if self._hwm is not None:
+            self._hwm.reset(session_id)
 
     @property
     def context(self) -> Context:
@@ -1248,23 +1285,24 @@ class MeshProxy:
 
         @app.post("/v1/destructive/check")
         def api_destructive_check(body: _ScanRequest):
-            """Check a command or SQL statement for destructive patterns.
+            """Check a command or SQL for destructive patterns.
 
-            Returns all matched rules with severity and description.
+            Returns the matched pattern with its stable id, category, and
+            arg_path so audit logs can pinpoint which argument triggered.
             """
-            from tessera.destructive_guard import check_destructive
-            result = check_destructive(body.text)
+            result = proxy._destructive_guard.check(
+                body.tool_name or "$raw",
+                body.text,
+            )
             return {
-                "destructive": result.destructive,
-                "should_block": result.should_block,
-                "max_severity": (
-                    result.max_severity.value if result.max_severity else None
-                ),
+                "allowed": result.allowed,
+                "primary_reason": result.primary_reason,
                 "matches": [
                     {
-                        "rule_id": m.rule_id,
-                        "severity": m.severity.value,
+                        "pattern_id": m.pattern_id,
+                        "category": m.category,
                         "description": m.description,
+                        "arg_path": m.arg_path,
                         "matched_text": m.matched_text,
                     }
                     for m in result.matches
@@ -1272,36 +1310,42 @@ class MeshProxy:
             }
 
         @app.post("/v1/sensitivity/classify")
-        def api_sensitivity_classify(body: _ScanRequest):
-            """Classify text into a sensitivity label.
+        def api_sensitivity_classify(body: _ClassifyRequest):
+            """Classify content and optionally update a trajectory HWM.
 
-            Does NOT update the trajectory watermark. Use /v1/label or
-            direct labeling to ingest content into the context.
+            If ``trajectory_id`` is provided, the HWM for that trajectory
+            is updated to max(current, classified_label). This is the
+            ONLY endpoint that mutates the HWM; keeps the evaluator's
+            read audit-pure.
             """
-            from tessera.sensitivity import classify
-            result = classify(body.text)
-            return {
+            result = proxy._classifier.classify(body.content)
+            response: dict[str, Any] = {
                 "label": result.label.name,
-                "level": int(result.label),
-                "matched_patterns": list(result.matched_patterns),
-                "confidence": result.score,
+                "label_rank": int(result.label),
+                "matched_rule_ids": list(result.matched_rule_ids),
             }
+            if body.trajectory_id:
+                new_mark = proxy._hwm.observe(body.trajectory_id, result.label)
+                response["trajectory_id"] = body.trajectory_id
+                response["high_water_mark"] = new_mark.name
+                response["high_water_mark_rank"] = int(new_mark)
+            return response
 
         @app.get("/v1/sensitivity/status")
-        def api_sensitivity_status():
-            """Current trajectory sensitivity high-water mark."""
-            if proxy._sensitivity is None:
-                return {
-                    "enabled": False,
-                    "max_sensitivity": "PUBLIC",
-                    "level": 0,
-                }
+        def api_sensitivity_status(trajectory_id: str = "default"):
+            """Current high-water mark for a trajectory."""
+            mark = proxy._hwm.get(trajectory_id)
             return {
-                "enabled": True,
-                "max_sensitivity": proxy._sensitivity.max_sensitivity.name,
-                "level": int(proxy._sensitivity.max_sensitivity),
-                "observations": len(proxy._sensitivity.classifications),
+                "trajectory_id": trajectory_id,
+                "high_water_mark": mark.name,
+                "high_water_mark_rank": int(mark),
             }
+
+        @app.delete("/v1/sensitivity/status")
+        def api_sensitivity_reset(trajectory_id: str):
+            """Clear HWM for a completed trajectory. Idempotent."""
+            proxy._hwm.reset(trajectory_id)
+            return {"trajectory_id": trajectory_id, "reset": True}
 
         # Mount xDS server endpoints if enabled
         if proxy._exports is not None:

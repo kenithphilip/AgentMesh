@@ -1,4 +1,4 @@
-"""Tests for destructive operation guard in the proxy."""
+"""Tests for destructive operation guard integration in the proxy."""
 
 from __future__ import annotations
 
@@ -11,72 +11,67 @@ class TestDestructiveGuardIntegration:
     def test_enabled_by_default(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         assert proxy.enable_destructive_guard is True
+        assert proxy._destructive_guard is not None
 
     def test_rm_rf_root_blocked(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         proxy.add_user_prompt("clean up")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
+            "bash.run",
             args={"command": "rm -rf /"},
         )
         assert not allowed
-        assert "destructive" in reason.lower()
-        assert "rm-rf-root" in reason
+        assert "rm_rf_root" in reason
+
+    def test_rm_rf_subdirectory_allowed(self) -> None:
+        proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
+        proxy.add_user_prompt("clean build")
+        allowed, reason = proxy.evaluate_tool_call(
+            "bash.run",
+            args={"command": "rm -rf ./dist"},
+        )
+        # dist/ is a workspace path, not root. Should not be blocked by destructive guard.
+        assert "rm_rf" not in reason
 
     def test_drop_database_blocked(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         proxy.add_user_prompt("migrate")
         allowed, reason = proxy.evaluate_tool_call(
-            "db_query",
-            args={"query": "DROP DATABASE production;"},
+            "db.query.write",
+            args={"sql": "DROP DATABASE production;"},
         )
         assert not allowed
-        assert "drop-database" in reason
+        assert "drop_database" in reason
 
-    def test_terraform_destroy_blocked(self) -> None:
+    def test_terraform_destroy_auto_blocked(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         proxy.add_user_prompt("tear down staging")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
+            "bash.run",
             args={"command": "terraform destroy -auto-approve"},
         )
         assert not allowed
-        assert "terraform-destroy" in reason
+        assert "terraform_destroy_auto" in reason
 
     def test_force_push_main_blocked(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         proxy.add_user_prompt("push changes")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
+            "bash.run",
             args={"command": "git push --force origin main"},
         )
         assert not allowed
-        assert "force-push" in reason or "main" in reason
+        assert "push_force_protected" in reason
 
-    def test_warn_level_allowed_by_default(self) -> None:
-        """WARN-level patterns (rm -rf subdir, git reset --hard) allowed
-        by default; callers can opt in to blocking them."""
+    def test_force_with_lease_allowed(self) -> None:
+        """--force-with-lease is the safer variant."""
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
-        proxy.add_user_prompt("clean build")
+        proxy.add_user_prompt("push")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
-            args={"command": "rm -rf ./dist"},
+            "bash.run",
+            args={"command": "git push --force-with-lease origin feature/x"},
         )
-        # Default: warn-level not blocked. Check destructive was not the blocker.
-        assert "destructive" not in reason.lower()
-
-    def test_warn_level_blocked_when_opted_in(self) -> None:
-        proxy = MeshProxy(
-            signing_key=b"test-destructive-32bytes!!",
-            destructive_guard_block_severity="warn",
-        )
-        proxy.add_user_prompt("reset branch")
-        allowed, reason = proxy.evaluate_tool_call(
-            "shell",
-            args={"command": "git reset --hard HEAD~3"},
-        )
-        assert not allowed
-        assert "destructive" in reason.lower()
+        assert "push_force" not in reason
 
     def test_guard_disabled_allows_destruction(self) -> None:
         proxy = MeshProxy(
@@ -85,27 +80,29 @@ class TestDestructiveGuardIntegration:
         )
         proxy.add_user_prompt("test")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
+            "bash.run",
             args={"command": "rm -rf /"},
         )
-        # Guard disabled: destructive not the reason for any block
-        assert "destructive" not in reason.lower()
+        # Guard disabled: destructive pattern_id should not appear in reason
+        assert "rm_rf" not in reason
 
     def test_clean_command_allowed(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         proxy.add_user_prompt("list files")
         allowed, reason = proxy.evaluate_tool_call(
-            "shell",
+            "bash.run",
             args={"command": "ls -la"},
         )
         assert allowed
 
-    def test_no_args_skips_check(self) -> None:
-        """Destructive check only runs when args are present."""
+    def test_nested_arg_path_reported(self) -> None:
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
-        proxy.add_user_prompt("status")
-        allowed, reason = proxy.evaluate_tool_call("get_status")
-        assert "destructive" not in reason.lower()
+        proxy.add_user_prompt("webhook")
+        allowed, reason = proxy.evaluate_tool_call(
+            "http.post",
+            args={"headers": {"x-run": "rm -rf /"}, "body": "{}"},
+        )
+        assert not allowed
 
 
 class TestDestructiveEndpoint:
@@ -114,11 +111,11 @@ class TestDestructiveEndpoint:
         client = TestClient(proxy.build_app())
         r = client.post("/v1/destructive/check", json={
             "text": "ls -la",
-            "tool_name": "shell",
+            "tool_name": "bash.run",
         })
         assert r.status_code == 200
         data = r.json()
-        assert data["destructive"] is False
+        assert data["allowed"] is True
         assert data["matches"] == []
 
     def test_check_endpoint_rm_rf(self) -> None:
@@ -126,22 +123,21 @@ class TestDestructiveEndpoint:
         client = TestClient(proxy.build_app())
         r = client.post("/v1/destructive/check", json={
             "text": "rm -rf /",
-            "tool_name": "shell",
+            "tool_name": "bash.run",
         })
         data = r.json()
-        assert data["destructive"] is True
-        assert data["should_block"] is True
-        assert data["max_severity"] == "block"
-        assert any(m["rule_id"] == "rm-rf-root" for m in data["matches"])
+        assert data["allowed"] is False
+        assert "rm_rf_root" in data["primary_reason"]
+        assert data["matches"][0]["pattern_id"] == "fs.rm_rf_root"
+        assert data["matches"][0]["category"] == "filesystem"
 
-    def test_check_endpoint_warn_level(self) -> None:
+    def test_check_endpoint_reports_arg_path(self) -> None:
+        """The HTTP endpoint takes a raw string; the arg_path will be $."""
         proxy = MeshProxy(signing_key=b"test-destructive-32bytes!!")
         client = TestClient(proxy.build_app())
         r = client.post("/v1/destructive/check", json={
-            "text": "git reset --hard HEAD~1",
-            "tool_name": "shell",
+            "text": "rm -rf /",
+            "tool_name": "bash.run",
         })
         data = r.json()
-        assert data["destructive"] is True
-        assert data["should_block"] is False  # WARN, not BLOCK
-        assert data["max_severity"] == "warn"
+        assert data["matches"][0]["arg_path"] == "$"

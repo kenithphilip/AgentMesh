@@ -4,20 +4,34 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agentmesh"
-version = "0.1.0"
-description = "Agent security mesh composing Tessera, agentgateway, and SPIRE."
+version = "0.3.0"
+description = "Agent security mesh with 23-endpoint proxy and framework SDK, composing 51 Tessera modules with SPIRE, agentgateway, and OpenTelemetry."
 requires-python = ">=3.12"
 license = { text = "AGPL-3.0-or-later" }
+readme = "README.md"
+authors = [{ name = "Kenith Philip" }]
 dependencies = [
-    "tessera-mesh>=0.3.0",
+    "tessera-mesh>=0.3.2",
     "fastapi>=0.110",
     "uvicorn>=0.29",
     "pyyaml>=6.0",
+    "httpx>=0.27",
+    "pydantic>=2.5",
 ]
+
+[project.urls]
+Homepage = "https://github.com/kenithphilip/AgentMesh"
+Repository = "https://github.com/kenithphilip/AgentMesh"
 
 [project.optional-dependencies]
 guardrail = [
     "anthropic>=0.30",
+]
+langchain = [
+    "langchain-core>=0.2",
+]
+openai-agents = [
+    "openai-agents>=0.0.3",
 ]
 dev = [
     "pytest>=8",

@@ -2,7 +2,7 @@
 
 **Status:** Draft v1 for discussion and iteration.
 
-**Position:** This document defines a proposed provider-neutral security mesh for agentic workloads. Tessera is not this mesh. Tessera is a reference implementation of two load-bearing primitives that fit inside it: signed context provenance labels and schema-enforced dual-LLM execution.
+**Position:** This document defines a proposed provider-neutral security mesh for agentic workloads. Tessera is the composable primitives library this mesh is built on. Two load-bearing invariants drive Tessera's design (signed trust labels with taint tracking, and schema-enforced dual-LLM execution); the library has grown around them to include hash-chained audit, decision replay, deterministic and LLM-driven policy synthesis, SSRF and URL gating, content scanning, identity, delegation, and provenance. Every supporting primitive composes with the two invariants but does not replace them.
 
 ## Normative Language
 
@@ -742,10 +742,18 @@ Properties:
 
 ## Relationship To Tessera
 
-Tessera already implements two primitives that belong inside this architecture:
+Tessera implements the two load-bearing invariants that belong inside this architecture:
 
 - content-bound signed labels on context segments with taint-tracking policy
 - schema-enforced dual-LLM execution for trusted control and untrusted data separation
+
+Around the two invariants, Tessera has grown to include hash-chained
+audit (`tessera.audit_log`), decision replay (`tessera.replay`),
+deterministic and LLM-driven policy synthesis (`tessera.policy_builder`,
+`tessera.policy_builder_llm`), SSRF and URL gating (`tessera.ssrf_guard`,
+`tessera.url_rules`), content scanning, identity, delegation, and
+provenance. These supporting primitives compose with the two invariants
+but do not replace them.
 
 Tessera should remain a portable primitive layer. It should not become a competing mesh control plane. That is already consistent with the current [roadmap](./ROADMAP.md), which explicitly says Tessera should not build a new control plane.
 

@@ -152,6 +152,14 @@ class MeshProxy:
     guardrail_provider: str | None = None
     guardrail_model: str | None = None
     injection_threshold: float = 0.75
+    # When True (default), the guardrail judge sees the post-redaction
+    # form of the tool output (secrets and PII replaced with placeholders).
+    # Set False to send the raw, pre-redaction text to the judge. The
+    # raw form gives the judge more signal but ships secrets to the
+    # provider; only opt out when the operator trusts the judge endpoint
+    # at the same level as the application LLM. The choice is recorded
+    # in each guardrail event detail under ``redacted_input``.
+    guardrail_redact_before_judge: bool = True
     require_identity: bool = False
     mcp_allowlist_patterns: list[str] = field(default_factory=list)
     rate_limit_calls: int = 50
@@ -802,6 +810,13 @@ class MeshProxy:
                 self._context.add(seg)
                 return output_text or "[blocked binary content]", TrustLevel.UNTRUSTED
 
+        # Snapshot the pre-redaction text. The guardrail can opt to see
+        # this raw form (more signal for the judge) instead of the
+        # redacted form (no secrets sent to the provider). Stored
+        # locally so subsequent phases can keep mutating output_text
+        # without losing the original.
+        pre_redaction_text = output_text
+
         # -- Phase 1: secret redaction --
         if self._secret_registry is not None and len(self._secret_registry) > 0:
             from tessera.redaction import redact_nested
@@ -867,7 +882,15 @@ class MeshProxy:
             override_confirmed = h_regex >= 0.9 and h_window >= 0.85
             is_tainted = d_result.detected or override_confirmed
             if not is_tainted and self._guardrail is not None:
-                is_tainted = self._guardrail.should_taint(output_text, tool_name)
+                judge_text = (
+                    output_text if self.guardrail_redact_before_judge
+                    else pre_redaction_text
+                )
+                is_tainted = self._guardrail.should_taint(
+                    judge_text,
+                    tool_name,
+                    redacted=self.guardrail_redact_before_judge,
+                )
         else:
             regex_match = h_regex >= 0.9
             window_corroborated = (

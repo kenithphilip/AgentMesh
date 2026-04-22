@@ -113,8 +113,19 @@ class _SSRFCheckRequest(BaseModel):
     url: str
 
 
+class _URLRulesCheckRequest(BaseModel):
+    url: str
+    method: str = "GET"
+
+
 class _PolicyBuilderRequest(BaseModel):
     min_label_signal: int = 3
+
+
+class _PolicyBuilderLLMRequest(BaseModel):
+    """Score=True replays each LLM proposal against history (one extra
+    call per proposal). Set False for fast preview without scoring."""
+    score: bool = True
 
 
 class _LabelRequest(BaseModel):
@@ -227,6 +238,15 @@ class MeshProxy:
     ssrf_blocked_hostnames: list[str] = field(default_factory=list)
     ssrf_allowlist_hostnames: list[str] | None = None
 
+    # Static URL pattern rules. A fast deterministic gate that runs
+    # before scanners and the SSRF guard. Hits short-circuit the rest
+    # of the pipeline; misses fall through to the full evaluator.
+    # Each rule is a dict with keys:
+    #   rule_id, pattern, kind ("exact" | "prefix" | "glob"),
+    #   action ("allow" | "deny"), methods (optional list), description
+    enable_url_rules: bool = True
+    url_rules: list[dict[str, Any]] = field(default_factory=list)
+
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
     _context: Context = field(default_factory=Context, init=False, repr=False)
@@ -256,6 +276,7 @@ class MeshProxy:
     _supply_chain_scanner: Any = field(default=None, init=False, repr=False)
     _yara_scanner: Any = field(default=None, init=False, repr=False)
     _ssrf_guard: Any = field(default=None, init=False, repr=False)
+    _url_rules: Any = field(default=None, init=False, repr=False)
     _audit_sink: Any = field(default=None, init=False, repr=False)
     _label_store: Any = field(default=None, init=False, repr=False)
 
@@ -485,6 +506,36 @@ class MeshProxy:
             allowlist_hostnames=self.ssrf_allowlist_hostnames,
         )
 
+        # 26. Static URL rules engine. Always instantiated so the
+        # endpoint is callable; only consulted in evaluate_tool_call
+        # when enable_url_rules is True and rules are non-empty.
+        from tessera.url_rules import (
+            PatternKind,
+            RuleAction,
+            URLRule,
+            URLRulesEngine,
+        )
+        rules = []
+        for spec in self.url_rules:
+            try:
+                rules.append(URLRule(
+                    rule_id=str(spec["rule_id"]),
+                    pattern=str(spec["pattern"]),
+                    kind=PatternKind(spec.get("kind", "exact")),
+                    action=RuleAction(spec.get("action", "allow")),
+                    methods=(
+                        tuple(m.upper() for m in spec["methods"])
+                        if spec.get("methods") is not None else None
+                    ),
+                    description=str(spec.get("description", "")),
+                ))
+            except (KeyError, ValueError):
+                # Skip malformed rule specs; the analyzer-style endpoint
+                # would surface these. The proxy itself fails open on
+                # config rather than failing to start.
+                continue
+        self._url_rules = URLRulesEngine(rules)
+
     # ------------------------------------------------------------------
     # Core evaluation pipeline
     # ------------------------------------------------------------------
@@ -568,6 +619,49 @@ class MeshProxy:
                     },
                 ))
                 return False, sc_result.primary_reason
+
+        # 2c-1. Static URL rules. Fast deterministic gate before the
+        # SSRF guard and scanners. Hits short-circuit (deny halts the
+        # call; allow signals "this URL is pre-vetted, skip nothing
+        # but still let scanners check non-URL args"). NO_MATCH falls
+        # through to the rest of the pipeline.
+        if (
+            self.enable_url_rules
+            and self._url_rules is not None
+            and self._url_rules.rule_count > 0
+            and args
+        ):
+            from tessera.ssrf_guard import _flatten_args, _URL_RE
+            method = (
+                str(args.get("method", "GET")).upper()
+                if isinstance(args, dict) else "GET"
+            )
+            for path, text in _flatten_args(args):
+                for match in _URL_RE.finditer(text):
+                    url = match.group(0)
+                    decision = self._url_rules.evaluate(url, method=method)
+                    if decision.verdict.value == "deny":
+                        from tessera.events import (
+                            EventKind, SecurityEvent, emit,
+                        )
+                        emit(SecurityEvent.now(
+                            kind=EventKind.POLICY_DENY,
+                            principal=agent_identity or self.principal,
+                            detail={
+                                "check": "url_rules",
+                                "tool": tool_name,
+                                "rule_id": decision.rule_id,
+                                "description": decision.description,
+                                "url": decision.url,
+                                "method": decision.method,
+                                "arg_path": path,
+                            },
+                        ))
+                        return False, (
+                            f"{decision.rule_id}: {decision.description}"
+                            if decision.description
+                            else f"url_rules: {decision.rule_id}"
+                        )
 
         # 2c-2. SSRF guard. Walks args for URL-shaped strings, resolves
         # hostnames, denies if anything resolves to private space, cloud
@@ -1691,6 +1785,79 @@ class MeshProxy:
                 ],
             }
 
+        @app.post("/v1/policy/builder/llm")
+        def api_policy_builder_llm(body: _PolicyBuilderLLMRequest):
+            """Generate proposals via the LLM proposer, optionally scored.
+
+            Reuses the same Anthropic / OpenAI client and model that
+            backs the LLMGuardrail. Returns 503-shaped JSON when the
+            guardrail isn't configured, since this endpoint shares the
+            judge endpoint trust boundary.
+
+            Templates the LLM may emit:
+              - tighten / loosen required_trust by one step
+              - mark_read_only (side_effects=False)
+              - register_tool with a starting required_trust
+
+            The deterministic baseline at /v1/policy/builder/run runs
+            independently and is what operators should trust by default;
+            this endpoint adds suggestions the heuristics cannot derive.
+            """
+            if proxy._audit_sink is None:
+                return {"configured": False}
+            if proxy._guardrail is None:
+                return {
+                    "configured": True,
+                    "llm_available": False,
+                    "reason": "guardrail_provider not configured",
+                }
+            from tessera.policy_builder import score_proposal
+            from tessera.policy_builder_llm import LLMPolicyProposer
+            proposer = LLMPolicyProposer(
+                client=proxy._guardrail._client,
+                model=proxy._guardrail._model,
+                client_type=proxy._guardrail._client_type,
+            )
+            proposals = proposer.propose(
+                proxy.audit_log_path,
+                current_policy=proxy._policy,
+                labels=proxy._label_store,
+            )
+            scored = []
+            for p in proposals:
+                entry = {
+                    "kind": p.kind.value,
+                    "tool_name": p.tool_name,
+                    "summary": p.summary,
+                    "rationale": p.rationale,
+                    "diff": p.diff,
+                    "current_required_trust": p.current_required_trust.name,
+                    "proposed_required_trust": p.proposed_required_trust.name,
+                }
+                if body.score:
+                    impact = score_proposal(
+                        p, proxy.audit_log_path,
+                        labels=proxy._label_store,
+                    )
+                    entry["impact"] = {
+                        "total": impact.stats.total,
+                        "agreed": impact.stats.agreed,
+                        "disagreed": impact.stats.disagreed,
+                        "errored": impact.stats.errored,
+                        "fixed": impact.stats.fixed,
+                        "regressed": impact.stats.regressed,
+                        "net_fixes": impact.net_fixes,
+                    }
+                scored.append(entry)
+            return {
+                "configured": True,
+                "llm_available": True,
+                "model": proxy._guardrail._model,
+                "breaker_state": proposer.breaker_state.state,
+                "count": len(scored),
+                "proposals": scored,
+            }
+
         @app.get("/v1/metrics/guardrail")
         def api_guardrail_metrics():
             """LLM guardrail call, cache, and circuit-breaker metrics.
@@ -1780,6 +1947,26 @@ class MeshProxy:
                     }
                     for f in result.findings
                 ],
+            }
+
+        @app.post("/v1/url-rules/check")
+        def api_url_rules_check(body: _URLRulesCheckRequest):
+            """Evaluate a URL+method against the static rules engine.
+
+            Returns the first decisive verdict (allow / deny) plus the
+            rule_id that produced it, or ``no_match`` to signal that
+            the slower checks (SSRF, scanners, LLM judge) would run
+            in evaluate_tool_call.
+            """
+            decision = proxy._url_rules.evaluate(body.url, method=body.method)
+            return {
+                "configured": proxy._url_rules.rule_count > 0,
+                "rule_count": proxy._url_rules.rule_count,
+                "verdict": decision.verdict.value,
+                "rule_id": decision.rule_id,
+                "description": decision.description,
+                "url": decision.url,
+                "method": decision.method,
             }
 
         @app.post("/v1/ssrf/check")

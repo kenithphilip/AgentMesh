@@ -113,6 +113,10 @@ class _SSRFCheckRequest(BaseModel):
     url: str
 
 
+class _PolicyBuilderRequest(BaseModel):
+    min_label_signal: int = 3
+
+
 class _LabelRequest(BaseModel):
     seq: int
     hash: str
@@ -1606,6 +1610,84 @@ class MeshProxy:
                         ).value,
                     }
                     for r in results
+                ],
+            }
+
+        @app.post("/v1/policy/builder/run")
+        def api_policy_builder_run(body: _PolicyBuilderRequest):
+            """Analyze the audit log and return scored policy proposals.
+
+            Reads the persistent audit log, aggregates per-tool counts
+            against the in-memory :class:`LabelStore`, and returns a list
+            of proposals ranked by net leverage (``fixed - regressed``).
+            Each entry includes the proposal's diff and the full replay
+            stats so operators can review before applying.
+
+            This is read-only. Apply a proposal by editing the policy
+            YAML by hand and reloading; intentional gap so the proxy
+            does not silently mutate live policy.
+            """
+            if proxy._audit_sink is None:
+                return {"configured": False}
+            from tessera.policy_builder import analyze_and_score
+            impacts = analyze_and_score(
+                proxy.audit_log_path,
+                current_policy=proxy._policy,
+                labels=proxy._label_store,
+                min_label_signal=body.min_label_signal,
+            )
+            return {
+                "configured": True,
+                "count": len(impacts),
+                "proposals": [
+                    {
+                        "kind": i.proposal.kind.value,
+                        "tool_name": i.proposal.tool_name,
+                        "summary": i.proposal.summary,
+                        "rationale": i.proposal.rationale,
+                        "diff": i.proposal.diff,
+                        "current_required_trust": (
+                            i.proposal.current_required_trust.name
+                        ),
+                        "proposed_required_trust": (
+                            i.proposal.proposed_required_trust.name
+                        ),
+                        "evidence": {
+                            "total_observations": (
+                                i.proposal.evidence.total_observations
+                            ),
+                            "denied": i.proposal.evidence.denied,
+                            "allowed": i.proposal.evidence.allowed,
+                            "labeled_correct_denials": (
+                                i.proposal.evidence.labeled_correct_denials
+                            ),
+                            "labeled_incorrect_denials": (
+                                i.proposal.evidence.labeled_incorrect_denials
+                            ),
+                            "labeled_correct_allows": (
+                                i.proposal.evidence.labeled_correct_allows
+                            ),
+                            "labeled_incorrect_allows": (
+                                i.proposal.evidence.labeled_incorrect_allows
+                            ),
+                        },
+                        "impact": {
+                            "total": i.stats.total,
+                            "agreed": i.stats.agreed,
+                            "disagreed": i.stats.disagreed,
+                            "errored": i.stats.errored,
+                            "fixed": i.stats.fixed,
+                            "regressed": i.stats.regressed,
+                            "net_fixes": i.net_fixes,
+                            "flipped_allow_to_deny": (
+                                i.stats.flipped_allow_to_deny
+                            ),
+                            "flipped_deny_to_allow": (
+                                i.stats.flipped_deny_to_allow
+                            ),
+                        },
+                    }
+                    for i in impacts
                 ],
             }
 

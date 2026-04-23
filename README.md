@@ -10,15 +10,24 @@ tools they call, enforcing taint tracking, content scanning, identity
 verification, persistent audit, decision replay, policy synthesis, and
 SSRF/URL gating, without changing your agent code.
 
-Built on [Tessera](https://github.com/kenithphilip/Tessera) v0.7.0
+Built on [Tessera](https://github.com/kenithphilip/Tessera) v0.7.x
 (composable primitives library), with support for SPIRE identity,
-agentgateway data plane, and OpenTelemetry observability.
+agentgateway data plane, and OpenTelemetry observability. The hot-path
+primitives (policy evaluation, scanners, audit chain, canonical JSON)
+are also available as the
+[`tessera-rs`](https://pypi.org/project/tessera-rs/) PyO3 wheel for
+adapter authors who want the Rust fast path without leaving Python.
 
 ## Quickstart
 
 ```bash
 # Install
 pip install agentmesh-mesh tessera-mesh
+
+# Optional: drop in the Rust fast-path for hot primitives
+# (compatible with the Python tessera-mesh package, no API changes)
+pip install tessera-rs            # latest stable, 0.8.0
+pip install tessera-rs==0.9.0a1   # prerelease with OTel-native spans
 
 # Start the demo tools server
 python examples/demo_tools_server.py &
@@ -34,6 +43,14 @@ MeshProxy(signing_key=b'your-key-here-at-least-16-bytes',
 pip install requests
 python examples/demo_agent.py
 ```
+
+> **Tessera Rust fast-path.** The optional `tessera-rs` wheel exposes
+> Rust implementations of `Policy.evaluate`, the heuristic and unicode
+> scanners, the hash-chained audit sink, and canonical JSON. The
+> Python `tessera-mesh` API stays the same; AgentMesh adapters can
+> swap in the Rust implementations where it matters. See
+> [Tessera's MIGRATION.md](https://github.com/kenithphilip/Tessera/blob/main/rust/crates/tessera-py/MIGRATION.md)
+> for the import map.
 
 ## Demo output
 

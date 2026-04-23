@@ -187,7 +187,10 @@ class TestRiskForecasting:
 
     def test_forecaster_disabled(self) -> None:
         proxy = MeshProxy(signing_key=b"k", enable_risk_forecasting=False)
-        assert proxy._risk_forecaster is None
+        # Per-session state: with the flag off, no session ever gets a
+        # forecaster, regardless of how many sessions are touched.
+        assert proxy._get_session_state("default").risk_forecaster is None
+        assert proxy._get_session_state("user-b").risk_forecaster is None
 
 
 # ---------------------------------------------------------------------------
@@ -229,7 +232,8 @@ class TestCanaryTokens:
 
     def test_no_canary_by_default(self) -> None:
         proxy = MeshProxy(signing_key=b"k")
-        assert proxy._canary_tracker is None
+        # Per-session: when the flag is off, no session ever gets a tracker.
+        assert proxy._get_session_state("default").canary_tracker is None
         proxy.add_user_prompt("read data")
         proxy.scan_and_label("list_items", "Item 1")
         last_seg = proxy.context.segments[-1]
@@ -324,9 +328,15 @@ class TestContextReset:
         proxy = MeshProxy(signing_key=b"k", enable_risk_forecasting=True)
         proxy.add_user_prompt("test")
         proxy.evaluate_tool_call("search")
+        # Capture the forecaster instance before reset.
+        before = proxy._get_session_state("default").risk_forecaster
+        assert before is not None
         proxy.reset_context()
-        # Forecaster should be fresh
-        assert proxy._risk_forecaster is not None
+        # After reset, the next access creates a fresh forecaster
+        # (different instance than the one we held).
+        after = proxy._get_session_state("default").risk_forecaster
+        assert after is not None
+        assert after is not before
 
 
 # ---------------------------------------------------------------------------
@@ -346,7 +356,7 @@ class TestHealthFeatures:
         data = r.json()
         assert data["trust_decay"] is True
         assert data["canary_tokens"] is True
-        assert data["version"] == "0.3.0"
+        assert data["version"] == "0.7.1"
 
 
 # ---------------------------------------------------------------------------

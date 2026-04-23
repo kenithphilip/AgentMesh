@@ -66,6 +66,7 @@ class _EvalRequest(BaseModel):
 class _ScanRequest(BaseModel):
     text: str
     tool_name: str = "unknown"
+    session_id: str = "default"
 
 
 class _ApprovalRequest(BaseModel):
@@ -143,6 +144,21 @@ class _ReplayRequest(BaseModel):
 
 
 @dataclass
+class _PerSessionState:
+    """Per-session resources that wrap or accompany a session's Context.
+
+    Created lazily by ``MeshProxy._get_session_state`` and dropped via the
+    SessionContextStore eviction callback so memory tracks the active
+    session set. ``risk_forecaster`` and ``canary_tracker`` are optional;
+    they are populated only when the corresponding feature flag is on.
+    """
+
+    accumulator: Any
+    risk_forecaster: Any | None = None
+    canary_tracker: Any | None = None
+
+
+@dataclass
 class MeshProxy:
     """AgentMesh MCP proxy with full enterprise defense stack.
 
@@ -203,6 +219,15 @@ class MeshProxy:
     # Defaults to ``<audit_log_path>.labels.json`` when audit log is on.
     audit_label_path: str | None = None
 
+    # Multi-tenant session state. Each session_id gets its own Context,
+    # DependencyAccumulator, risk forecaster, and canary tracker. Sessions
+    # expire after ``session_context_ttl_seconds`` of inactivity; the LRU
+    # session is evicted when active sessions exceed ``session_context_max``.
+    # Defaults give a one-hour lifetime and a 10,000-session cap; tighten
+    # both for high-fanout deployments.
+    session_context_ttl_seconds: float = 3600.0
+    session_context_max: int = 10000
+
     # Tier A+B: identity, transport, exports
     trust_domain: str = "agentmesh.local"
     spire_socket: str | None = None
@@ -249,15 +274,17 @@ class MeshProxy:
 
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
-    _context: Context = field(default_factory=Context, init=False, repr=False)
+    # Per-session state lives here. _contexts is the canonical session
+    # store (TTL + LRU eviction); _session_states holds the adjacent
+    # accumulator / forecaster / canary tracker keyed on the same
+    # session_ids, cleaned up via the eviction callback.
+    _contexts: Any = field(default=None, init=False, repr=False)
+    _session_states: dict = field(default_factory=dict, init=False, repr=False)
     _guardrail: Any = field(default=None, init=False, repr=False)
     _rate_limiter: Any = field(default=None, init=False, repr=False)
     _mcp_allowlist: Any = field(default=None, init=False, repr=False)
     _audit_log: Any = field(default=None, init=False, repr=False)
     _definition_tracker: Any = field(default=None, init=False, repr=False)
-    _accumulator: Any = field(default=None, init=False, repr=False)
-    _risk_forecaster: Any = field(default=None, init=False, repr=False)
-    _canary_tracker: Any = field(default=None, init=False, repr=False)
     _secret_registry: Any = field(default=None, init=False, repr=False)
     _trust_decay_policy: Any = field(default=None, init=False, repr=False)
     _loop_guard: Any = field(default=None, init=False, repr=False)
@@ -361,24 +388,23 @@ class MeshProxy:
         from tessera.mcp_allowlist import ToolDefinitionTracker
         self._definition_tracker = ToolDefinitionTracker()
 
-        # 7. Value-level taint (DependencyAccumulator)
-        from tessera.taint import DependencyAccumulator
-        self._accumulator = DependencyAccumulator(context=self._context)
+        # 7. Per-session Context store (SessionContextStore). Every
+        # taint-tracking decision runs against a session-scoped Context,
+        # so user A's web-tainted segments cannot deny user B's tool
+        # calls. Accumulator, forecaster, and canary tracker are
+        # session-scoped too and live in ``_session_states``, cleaned
+        # up by the eviction callback in lockstep with their Context.
+        from tessera.session_context import SessionContextStore
+        self._contexts = SessionContextStore(
+            ttl_seconds=self.session_context_ttl_seconds,
+            max_sessions=self.session_context_max,
+            on_evict=self._on_session_evicted,
+        )
 
         # 8. Secret registry for redaction
         if self.enable_secret_redaction:
             from tessera.redaction import SecretRegistry
             self._secret_registry = SecretRegistry()
-
-        # 9. Risk forecaster (salami detection, drift, commitment creep)
-        if self.enable_risk_forecasting:
-            from tessera.risk.forecaster import SessionRiskForecaster
-            self._risk_forecaster = SessionRiskForecaster()
-
-        # 10. Canary tracker
-        if self.enable_canary_tokens:
-            from tessera.scanners.canary import SegmentCanaryTracker
-            self._canary_tracker = SegmentCanaryTracker()
 
         # 11. PII scanner
         if self.enable_pii_scanning:
@@ -535,6 +561,45 @@ class MeshProxy:
                 # config rather than failing to start.
                 continue
         self._url_rules = URLRulesEngine(rules)
+
+    # ------------------------------------------------------------------
+    # Per-session state helpers
+    # ------------------------------------------------------------------
+
+    def _get_session_state(self, session_id: str = "default") -> _PerSessionState:
+        """Return per-session accumulator / forecaster / canary tracker.
+
+        Created lazily on first access. The corresponding Context is
+        ensured first via :meth:`_contexts.get` so the accumulator's
+        underlying Context is the same object the proxy will read and
+        write through ``self._contexts.get(session_id)`` everywhere
+        else. Cleared by :meth:`_on_session_evicted` when the
+        SessionContextStore drops the session.
+        """
+        state = self._session_states.get(session_id)
+        if state is not None:
+            return state
+        from tessera.taint import DependencyAccumulator
+        ctx = self._contexts.get(session_id)
+        state = _PerSessionState(
+            accumulator=DependencyAccumulator(context=ctx),
+        )
+        if self.enable_risk_forecasting:
+            from tessera.risk.forecaster import SessionRiskForecaster
+            state.risk_forecaster = SessionRiskForecaster()
+        if self.enable_canary_tokens:
+            from tessera.scanners.canary import SegmentCanaryTracker
+            state.canary_tracker = SegmentCanaryTracker()
+        self._session_states[session_id] = state
+        return state
+
+    def _on_session_evicted(self, session_id: str) -> None:
+        """SessionContextStore eviction callback.
+
+        Drops the per-session adjacent state so memory tracks the active
+        session set. Idempotent (the dict pop handles the missing case).
+        """
+        self._session_states.pop(session_id, None)
 
     # ------------------------------------------------------------------
     # Core evaluation pipeline
@@ -726,11 +791,13 @@ class MeshProxy:
                 return False, f"delegation: {str(e)[:100]}"
 
         # 4. Policy evaluation (taint tracking, with optional trust decay)
-        eval_context = self._context
+        # Per-session: every other session's segments are invisible here.
+        session_ctx = self._contexts.get(session_id)
+        eval_context = session_ctx
         if self._trust_decay_policy is not None:
             from tessera.trust_decay import DecayAwareContext
             eval_context = DecayAwareContext(
-                self._context, policy=self._trust_decay_policy,
+                session_ctx, policy=self._trust_decay_policy,
             )
 
         decision = self._policy.evaluate(
@@ -783,17 +850,20 @@ class MeshProxy:
                 violations = "; ".join(v[1] for v in guard_result.violations)
                 return False, f"read-only guard: {violations}"
 
-        # 8. Value-level taint (per-argument provenance)
-        if args and self._accumulator is not None:
+        # 8. Value-level taint (per-argument provenance, session-scoped)
+        sess_state = self._get_session_state(session_id)
+        if args and sess_state.accumulator is not None:
             for arg_name, arg_val in args.items():
                 if isinstance(arg_val, str) and len(arg_val) >= 3:
-                    self._accumulator.bind_from_tool_output(arg_name, arg_val, tool_name)
+                    sess_state.accumulator.bind_from_tool_output(
+                        arg_name, arg_val, tool_name,
+                    )
 
         # 9. Plan verification (tool sequence vs user intent)
-        if self.enable_plan_verification and self._context.segments:
+        if self.enable_plan_verification and session_ctx.segments:
             from tessera.plan_verifier import infer_spec_from_prompt, verify_sequence
             user_segs = [
-                s for s in self._context.segments
+                s for s in session_ctx.segments
                 if s.label.trust_level >= TrustLevel.USER
             ]
             if user_segs:
@@ -803,10 +873,14 @@ class MeshProxy:
                     return False, f"plan verifier: {'; '.join(result.violations)}"
 
         # 10. Risk forecasting (salami detection, dynamic irreversibility)
-        if self._risk_forecaster is not None:
+        # Per-session: each tenant's salami chain is tracked separately,
+        # so user A's call pattern cannot trip user B's threshold.
+        if sess_state.risk_forecaster is not None:
             from tessera.risk.irreversibility import score_irreversibility
             irrev = score_irreversibility(tool_name, args)
-            risk = self._risk_forecaster.record(tool_name, args, irrev_score=irrev.final_score)
+            risk = sess_state.risk_forecaster.record(
+                tool_name, args, irrev_score=irrev.final_score,
+            )
             if risk.should_pause:
                 return False, f"risk forecast: overall_risk={risk.overall_risk:.1f} (threshold exceeded)"
 
@@ -815,7 +889,7 @@ class MeshProxy:
             from tessera.read_only_guard import check_toxic_flow
             has_untrusted = any(
                 s.label.trust_level < TrustLevel.USER
-                for s in self._context.segments
+                for s in session_ctx.segments
             )
             has_sensitive = any(
                 kw in str(args).lower()
@@ -905,7 +979,7 @@ class MeshProxy:
                     Origin.WEB, self.principal, self.signing_key,
                     trust_level=TrustLevel.UNTRUSTED,
                 )
-                self._context.add(seg)
+                self._contexts.get(session_id).add(seg)
                 return output_text or "[blocked binary content]", TrustLevel.UNTRUSTED
 
         # Snapshot the pre-redaction text. The guardrail can opt to see
@@ -1003,7 +1077,7 @@ class MeshProxy:
         # Phase 2b: intent verification (unrequested actions)
         from tessera.scanners.intent import scan_intent
         user_segs = [
-            s for s in self._context.segments
+            s for s in self._contexts.get(session_id).segments
             if s.label.trust_level >= TrustLevel.USER
         ]
         user_prompt = user_segs[0].content if user_segs else None
@@ -1019,18 +1093,24 @@ class MeshProxy:
         origin = Origin.WEB if is_tainted else Origin.TOOL
 
         # -- Phase 3: canary injection (before adding to context) --
+        # Per-session canary tracker: tokens injected for session A
+        # cannot be matched against session B's response.
         labeled_text = output_text
-        if self._canary_tracker is not None:
-            seg_id = f"seg_{len(self._context.segments)}"
-            labeled_text, _token = self._canary_tracker.inject_segment(seg_id, output_text)
+        sess_state = self._get_session_state(session_id)
+        session_ctx = self._contexts.get(session_id)
+        if sess_state.canary_tracker is not None:
+            seg_id = f"seg_{len(session_ctx.segments)}"
+            labeled_text, _token = sess_state.canary_tracker.inject_segment(
+                seg_id, output_text,
+            )
             if is_tainted:
-                self._canary_tracker.flag_directive(seg_id)
+                sess_state.canary_tracker.flag_directive(seg_id)
 
         seg = make_segment(
             labeled_text, origin, self.principal, self.signing_key,
             trust_level=trust,
         )
-        self._context.add(seg)
+        session_ctx.add(seg)
 
         if is_tainted:
             from tessera.events import EventKind, SecurityEvent, emit
@@ -1106,13 +1186,16 @@ class MeshProxy:
             ],
         }
 
-    def add_user_prompt(self, prompt: str) -> tuple[bool, str]:
-        """Add a user prompt to the context, with optional screening.
+    def add_user_prompt(
+        self, prompt: str, session_id: str = "default",
+    ) -> tuple[bool, str]:
+        """Add a user prompt to a session's context, with optional screening.
 
         Returns (passed, reason). If screening fails, the prompt is still
         added but labeled UNTRUSTED to prevent a phished prompt from
         carrying USER trust.
         """
+        session_ctx = self._contexts.get(session_id)
         if self.enable_prompt_screening:
             from tessera.scanners.prompt_screen import screen_and_emit
             result = screen_and_emit(prompt, principal=self.principal)
@@ -1121,7 +1204,7 @@ class MeshProxy:
                     prompt, Origin.USER, self.principal, self.signing_key,
                     trust_level=TrustLevel.UNTRUSTED,
                 )
-                self._context.add(seg)
+                session_ctx.add(seg)
                 return False, f"prompt screening failed: {result.reason}"
 
         # Check for delegated prompt injection (instructions from external content)
@@ -1132,21 +1215,24 @@ class MeshProxy:
                     prompt, Origin.USER, self.principal, self.signing_key,
                     trust_level=TrustLevel.TOOL,
                 )
-                self._context.add(seg)
+                session_ctx.add(seg)
                 return True, f"delegation detected: {delegation['source_description']}"
 
         seg = make_segment(prompt, Origin.USER, self.principal, self.signing_key)
-        self._context.add(seg)
+        session_ctx.add(seg)
         return True, "clean"
 
-    def build_provenance_manifest(self) -> dict[str, Any]:
-        """Build a signed provenance manifest for the current context."""
+    def build_provenance_manifest(
+        self, session_id: str = "default",
+    ) -> dict[str, Any]:
+        """Build a signed provenance manifest for a session's current context."""
         from tessera.provenance import ContextSegmentEnvelope, PromptProvenanceManifest
+        session_ctx = self._contexts.get(session_id)
         envelopes = [
             ContextSegmentEnvelope.from_segment(
                 seg, issuer=self.principal, key=self.signing_key,
             )
-            for seg in self._context.segments
+            for seg in session_ctx.segments
         ]
         if not envelopes:
             return {"segments": 0, "manifest": None}
@@ -1155,10 +1241,10 @@ class MeshProxy:
         )
         return {"segments": len(envelopes), "manifest": manifest.to_dict()}
 
-    def split_context(self) -> dict[str, Any]:
-        """Split context into trusted and untrusted halves."""
+    def split_context(self, session_id: str = "default") -> dict[str, Any]:
+        """Split a session's context into trusted and untrusted halves."""
         from tessera.quarantine import split_by_trust
-        trusted, untrusted = split_by_trust(self._context)
+        trusted, untrusted = split_by_trust(self._contexts.get(session_id))
         return {
             "trusted_segments": len(trusted.segments),
             "untrusted_segments": len(untrusted.segments),
@@ -1192,8 +1278,11 @@ class MeshProxy:
             "escalation_level": self._cooldown.state().level,
         }
 
-    def check_output_provenance(self, model_response: str, user_task: str = "") -> dict:
-        """Post-generation check for output manipulation.
+    def check_output_provenance(
+        self, model_response: str, user_task: str = "",
+        session_id: str = "default",
+    ) -> dict:
+        """Post-generation check for output manipulation, scoped to a session.
 
         Detects when injected content influences the model's text response
         (the travel-injection attack class where there is no tool call to
@@ -1201,7 +1290,9 @@ class MeshProxy:
         """
         from tessera.output_monitor import check_output_integrity
         result = check_output_integrity(
-            model_response, self._context, user_task=user_task,
+            model_response,
+            self._contexts.get(session_id),
+            user_task=user_task,
         )
         return {
             "safe": result.action != "block",
@@ -1210,11 +1301,14 @@ class MeshProxy:
             "patterns": list(result.patterns_matched),
         }
 
-    def check_canary_leakage(self, model_response: str) -> list[dict]:
-        """Check if model response contains canary tokens from tainted segments."""
-        if self._canary_tracker is None:
+    def check_canary_leakage(
+        self, model_response: str, session_id: str = "default",
+    ) -> list[dict]:
+        """Check if model response contains canary tokens from a session's tainted segments."""
+        sess_state = self._session_states.get(session_id)
+        if sess_state is None or sess_state.canary_tracker is None:
             return []
-        influences = self._canary_tracker.check_response(model_response)
+        influences = sess_state.canary_tracker.check_response(model_response)
         return [
             {
                 "segment_id": inf.segment_id,
@@ -1230,25 +1324,46 @@ class MeshProxy:
             self._secret_registry.add(name, value)
 
     def reset_context(self, session_id: str = "default") -> None:
-        """Reset per-session state.
+        """Drop a single session's state. Other sessions are untouched.
 
-        Clears the Tessera Context (shared across sessions in this simple
-        proxy) and resets the sensitivity HWM for the given session.
-        Multi-tenant proxies should key Context per session too.
+        Clears the session's Context, accumulator, risk forecaster, and
+        canary tracker (via the SessionContextStore eviction callback)
+        and resets the sensitivity HWM for that session.
         """
-        self._context = Context()
-        if self._accumulator is not None:
-            from tessera.taint import DependencyAccumulator
-            self._accumulator = DependencyAccumulator(context=self._context)
-        if self._risk_forecaster is not None:
-            from tessera.risk.forecaster import SessionRiskForecaster
-            self._risk_forecaster = SessionRiskForecaster()
+        self._contexts.reset(session_id)
         if self._hwm is not None:
             self._hwm.reset(session_id)
 
+    def reset_all_sessions(self) -> None:
+        """Drop every session. Useful for tests and operator-driven resets.
+
+        Resets the HWM for each session id known to the context store
+        before dropping the contexts; sessions whose HWM was set without
+        ever calling :meth:`add_user_prompt` (e.g. via direct
+        ``/v1/sensitivity/classify`` calls) won't be reset here. Use
+        :meth:`reset_context` for those individually.
+        """
+        if self._hwm is not None:
+            for sid in self._contexts.session_ids():
+                self._hwm.reset(sid)
+        self._contexts.reset_all()
+
     @property
     def context(self) -> Context:
-        return self._context
+        """The default-session Context.
+
+        Backward-compat alias for ``self._contexts.get("default")``. New
+        callers should pass an explicit ``session_id`` to the methods
+        that take it (``add_user_prompt``, ``scan_and_label``,
+        ``evaluate_tool_call``, ``split_context``,
+        ``build_provenance_manifest``) so cross-session isolation holds.
+        """
+        return self._contexts.get("default")
+
+    @property
+    def contexts(self):
+        """The full :class:`SessionContextStore` for inspection / GC."""
+        return self._contexts
 
     @property
     def policy(self) -> Policy:
@@ -1331,12 +1446,17 @@ class MeshProxy:
 
         @app.get("/healthz")
         def healthz():
+            default_ctx = proxy._contexts.get("default")
             return {
                 "status": "ok",
                 "service": "agentmesh-proxy",
-                "version": "0.3.0",
-                "context_segments": len(proxy._context.segments),
-                "min_trust": int(proxy._context.min_trust),
+                "version": "0.7.1",
+                # Default session is shown for backward compat; for the
+                # full picture across tenants, see /v1/sessions.
+                "context_segments": len(default_ctx.segments),
+                "min_trust": int(default_ctx.min_trust),
+                "active_sessions": len(proxy._contexts),
+                "session_evictions": proxy._contexts.evictions,
                 "guardrail_enabled": proxy._guardrail is not None,
                 "guardrail_breaker": (
                     proxy._guardrail.stats.get("breaker")
@@ -1356,8 +1476,9 @@ class MeshProxy:
 
         @app.post("/v1/evaluate")
         def api_evaluate(body: _EvalRequest):
-            if body.user_prompt and not proxy._context.segments:
-                proxy.add_user_prompt(body.user_prompt)
+            session_ctx = proxy._contexts.get(body.session_id)
+            if body.user_prompt and not session_ctx.segments:
+                proxy.add_user_prompt(body.user_prompt, session_id=body.session_id)
             allowed, reason = proxy.evaluate_tool_call(
                 body.tool_name, body.args,
                 session_id=body.session_id,
@@ -1367,7 +1488,8 @@ class MeshProxy:
             return {
                 "allowed": allowed,
                 "reason": reason,
-                "trust_level": int(proxy._context.min_trust),
+                "session_id": body.session_id,
+                "trust_level": int(session_ctx.min_trust),
             }
 
         @app.post("/v1/scan")
@@ -1387,11 +1509,15 @@ class MeshProxy:
 
         @app.post("/v1/label")
         def api_label(body: _ScanRequest):
-            _, trust = proxy.scan_and_label(body.tool_name, body.text)
+            _, trust = proxy.scan_and_label(
+                body.tool_name, body.text, session_id=body.session_id,
+            )
+            session_ctx = proxy._contexts.get(body.session_id)
             return {
                 "trust_level": int(trust),
-                "context_segments": len(proxy._context.segments),
-                "min_trust": int(proxy._context.min_trust),
+                "session_id": body.session_id,
+                "context_segments": len(session_ctx.segments),
+                "min_trust": int(session_ctx.min_trust),
             }
 
         @app.get("/v1/policy")
@@ -1411,17 +1537,38 @@ class MeshProxy:
             }
 
         @app.get("/v1/context")
-        def api_context():
+        def api_context(session_id: str = "default"):
+            """Snapshot of one session's Context.
+
+            Pass ``session_id`` to inspect a specific tenant; without
+            it, returns the default session. Sessions are isolated:
+            two tenants on the same proxy never share segments.
+            """
+            ctx = proxy._contexts.get(session_id)
             return {
-                "segments": len(proxy._context.segments),
-                "min_trust": int(proxy._context.min_trust),
-                "max_trust": int(proxy._context.max_trust),
+                "session_id": session_id,
+                "segments": len(ctx.segments),
+                "min_trust": int(ctx.min_trust),
+                "max_trust": int(ctx.max_trust),
             }
 
         @app.post("/v1/reset")
-        def api_reset():
-            proxy.reset_context()
-            return {"status": "context reset"}
+        def api_reset(session_id: str = "default"):
+            """Drop one session. Other sessions are untouched."""
+            proxy.reset_context(session_id)
+            return {"status": "context reset", "session_id": session_id}
+
+        @app.get("/v1/sessions")
+        def api_sessions():
+            """List active session ids and the store's eviction stats."""
+            store = proxy._contexts
+            return {
+                "count": len(store),
+                "session_ids": store.session_ids(),
+                "evictions": store.evictions,
+                "ttl_seconds": proxy.session_context_ttl_seconds,
+                "max_sessions": proxy.session_context_max,
+            }
 
         @app.get("/v1/rate-limit/{session_id}")
         def api_rate_limit(session_id: str):
@@ -1449,11 +1596,20 @@ class MeshProxy:
             }
 
         @app.post("/v1/check-output")
-        def api_check_output(body: _CheckOutputRequest):
-            """Post-generation output provenance and integrity check."""
-            provenance = proxy.check_output_provenance(body.response, body.user_task)
-            canary = proxy.check_canary_leakage(body.response)
+        def api_check_output(
+            body: _CheckOutputRequest, session_id: str = "default",
+        ):
+            """Post-generation output provenance and integrity check.
+
+            Scoped to ``session_id``; the canary leakage check only
+            matches tokens that were injected for the same session.
+            """
+            provenance = proxy.check_output_provenance(
+                body.response, body.user_task, session_id=session_id,
+            )
+            canary = proxy.check_canary_leakage(body.response, session_id=session_id)
             return {
+                "session_id": session_id,
                 "provenance": provenance,
                 "canary_leakage": canary,
                 "safe": provenance["safe"] and len(canary) == 0,
@@ -1503,14 +1659,14 @@ class MeshProxy:
         # -- Tier A+B endpoints --
 
         @app.get("/v1/provenance")
-        def api_provenance():
-            """Build and return a signed provenance manifest."""
-            return proxy.build_provenance_manifest()
+        def api_provenance(session_id: str = "default"):
+            """Build and return a signed provenance manifest for one session."""
+            return proxy.build_provenance_manifest(session_id=session_id)
 
         @app.get("/v1/context/split")
-        def api_context_split():
-            """Split context into trusted and untrusted halves."""
-            return proxy.split_context()
+        def api_context_split(session_id: str = "default"):
+            """Split one session's context into trusted / untrusted halves."""
+            return proxy.split_context(session_id=session_id)
 
         @app.get("/v1/evidence")
         def api_evidence():

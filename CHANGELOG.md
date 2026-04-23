@@ -7,6 +7,62 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Everything before v1.0.0 is experimental; API changes may occur in any
 minor release.
 
+## [0.7.1] - 2026-04-23
+
+Requires `tessera-mesh>=0.7.1`.
+
+### Fixed
+
+- **Multi-tenant Context isolation.** v0.7.0 and earlier shared one
+  `Context` across all sessions. Combined with the taint-tracking
+  invariant (`min_trust` over every segment drives the verdict), this
+  meant a web-tainted segment from session A would deny tool calls
+  from session B running on the same proxy. v0.7.1 keeps each session's
+  Context, `DependencyAccumulator`, risk forecaster, and canary tracker
+  isolated. Cross-session interference cannot happen.
+
+### Added
+
+- `MeshProxy.session_context_ttl_seconds` and
+  `MeshProxy.session_context_max` config fields control the per-session
+  state lifetime and the LRU cap.
+- `GET /v1/sessions` returns active session ids, eviction count, and
+  the configured limits.
+- `MeshProxy.reset_all_sessions()` for operator-driven full reset.
+- `_PerSessionState` dataclass groups the adjacent per-session
+  resources (accumulator + forecaster + canary tracker) so they are
+  created and dropped atomically.
+
+### Changed
+
+- `MeshProxy.add_user_prompt`, `build_provenance_manifest`,
+  `split_context`, `check_output_provenance`, and
+  `check_canary_leakage` now take `session_id: str = "default"`.
+- `MeshProxy.context` property remains a backward-compat alias for
+  `self._contexts.get("default")`.
+- The endpoints `/v1/context`, `/v1/context/split`, `/v1/provenance`,
+  `/v1/check-output`, and `/v1/reset` accept `session_id` as a query
+  parameter; `/v1/evaluate` and `/v1/label` accept it in the request
+  body. Omitting `session_id` defaults to the literal session named
+  `default` for backward compat.
+- `MeshClient` propagates its `session_id` field through every
+  endpoint call (previously only `evaluate` and `add_prompt` did).
+- `MeshProxy` no longer holds standalone `_accumulator`,
+  `_risk_forecaster`, or `_canary_tracker` attributes. Tests that
+  checked these need to read `proxy._get_session_state(session_id)`
+  instead.
+- The proxy's `version` field in `/healthz` now reads `0.7.1`.
+
+### Verified
+
+- 240 passing tests; same 2 pre-existing async-fixture failures as
+  v0.7.0.
+- 16 new tests in `test_session_isolation.py` covering the headline
+  bug (alice's taint does not deny bob), per-session accumulator /
+  forecaster / canary isolation, eviction callback cleanup, every
+  endpoint that accepts `session_id`, and backward compatibility for
+  callers that omit `session_id`.
+
 ## [0.7.0] - 2026-04-22
 
 Requires `tessera-mesh>=0.7.0`.

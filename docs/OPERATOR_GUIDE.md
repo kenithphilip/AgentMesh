@@ -2,6 +2,33 @@
 
 This guide covers operational procedures for the AgentMesh docker-compose deployment. You manage identity (SPIRE), data plane (agentgateway), policy (Tessera proxy), and observability (OTel collector).
 
+## Multi-tenant deployment
+
+The proxy keeps each session's Context, accumulator, risk forecaster, and canary tracker isolated. A web-tainted segment from session A cannot deny a tool call from session B. Pass a unique `session_id` per tenant or per conversation; the proxy creates state lazily on first reference.
+
+Two configuration knobs control session-state lifetime:
+
+```python
+MeshProxy(
+    session_context_ttl_seconds=3600,   # default 1 hour
+    session_context_max=10000,          # default 10k sessions
+    ...
+)
+```
+
+`session_context_ttl_seconds` evicts a session after that many seconds of inactivity. `session_context_max` caps the live session set; on overflow the least-recently-used session is dropped. Both defaults suit a typical small-team deployment; tighten the TTL for high-fanout traffic, raise the cap if you have 10k+ concurrent active conversations.
+
+The `GET /v1/sessions` endpoint returns the active session ids, eviction count, and the configured limits, so operators can monitor tenant fanout without scraping logs.
+
+Per-session SDK use is automatic when you pass `session_id=` to `MeshClient`:
+
+```python
+alice = MeshClient(base_url="http://proxy:9090", session_id="alice")
+bob = MeshClient(base_url="http://proxy:9090", session_id="bob")
+```
+
+The endpoints `/v1/context`, `/v1/context/split`, `/v1/provenance`, `/v1/check-output`, and `/v1/reset` accept `session_id` as a query parameter; `/v1/evaluate` and `/v1/label` take it in the request body. Omitting `session_id` defaults to the literal session named `default`.
+
 ## Prerequisites
 
 You have the docker-compose deployment running:

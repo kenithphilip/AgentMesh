@@ -100,7 +100,7 @@ class MeshClient:
         return r.get("allowed", False), r.get("reason", "unknown")
 
     def label(self, tool_name: str, output_text: str) -> dict[str, Any]:
-        """Scan and label tool output, adding it to the context.
+        """Scan and label tool output, adding it to this session's context.
 
         The proxy runs all scanners (heuristic, directive, intent,
         unicode, PII, secret redaction) and returns the trust level.
@@ -108,6 +108,7 @@ class MeshClient:
         return self._post("/v1/label", {
             "text": output_text,
             "tool_name": tool_name,
+            "session_id": self.session_id,
         })
 
     def scan(self, text: str, tool_name: str = "unknown") -> dict[str, Any]:
@@ -118,14 +119,18 @@ class MeshClient:
         })
 
     def reset(self) -> dict[str, Any]:
-        """Reset the proxy context for a new session."""
-        return self._post("/v1/reset", {})
+        """Reset this session's context. Other sessions are untouched."""
+        return self._http.post(
+            "/v1/reset", params={"session_id": self.session_id},
+        ).json()
 
     # -- Observability --
 
     def context(self) -> dict[str, Any]:
-        """Get current context state (segment count, trust levels)."""
-        return self._get("/v1/context")
+        """Get this session's context state (segment count, trust levels)."""
+        return self._http.get(
+            "/v1/context", params={"session_id": self.session_id},
+        ).json()
 
     def audit(self) -> dict[str, Any]:
         """Get audit chain status."""
@@ -140,8 +145,10 @@ class MeshClient:
         return self._get("/v1/evidence")
 
     def provenance(self) -> dict[str, Any]:
-        """Get signed provenance manifest for the current context."""
-        return self._get("/v1/provenance")
+        """Get signed provenance manifest for this session's current context."""
+        return self._http.get(
+            "/v1/provenance", params={"session_id": self.session_id},
+        ).json()
 
     # -- RAG guard --
 
@@ -165,11 +172,14 @@ class MeshClient:
         response: str,
         user_task: str = "",
     ) -> dict[str, Any]:
-        """Post-generation output integrity and canary check."""
-        return self._post("/v1/check-output", {
-            "response": response,
-            "user_task": user_task,
-        })
+        """Post-generation output integrity and canary check (per session)."""
+        r = self._http.post(
+            "/v1/check-output",
+            params={"session_id": self.session_id},
+            json={"response": response, "user_task": user_task},
+        )
+        r.raise_for_status()
+        return r.json()
 
     # -- Agent liveness --
 

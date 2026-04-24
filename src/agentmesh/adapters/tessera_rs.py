@@ -49,6 +49,10 @@ class _TesseraRsBundle:
     trigger the submodule imports automatically (they are pure-
     Python shims around ``tessera_rs._native``), so we eagerly
     import them once at module load.
+
+    ``ratelimit`` is loaded lazily so older ``tessera-rs`` wheels
+    (<0.11.0) without the rate limiter still pass the version check.
+    Read via :attr:`ratelimit_available` before using.
     """
 
     def __init__(self) -> None:
@@ -63,6 +67,14 @@ class _TesseraRsBundle:
         self.scanners = scanners
         self.ssrf = ssrf
         self.url_rules = url_rules
+        try:
+            from tessera_rs import ratelimit
+
+            self.ratelimit = ratelimit
+            self.ratelimit_available = True
+        except ImportError:
+            self.ratelimit = None
+            self.ratelimit_available = False
 
 
 def _try_import_tessera_rs() -> _TesseraRsBundle | None:
@@ -642,6 +654,109 @@ class RustCelPolicyEngineAdapter:
         )
 
 
+# ---------------------------------------------------------------------------
+# Rate limiter adapter
+# ---------------------------------------------------------------------------
+
+
+class RustToolCallRateLimitAdapter:
+    """Drop-in for ``tessera.ratelimit.ToolCallRateLimit``.
+
+    Constructor accepts the same keyword arguments (with
+    ``timedelta`` converted to seconds for the Rust binding). The
+    ``check`` method returns ``(allowed, reason_or_None)`` shaped
+    identically to the Python class.
+
+    Falls back to Python only when the installed ``tessera-rs``
+    wheel predates 0.11.0 (no ``ratelimit`` submodule).
+    """
+
+    def __init__(
+        self,
+        max_calls: int = 50,
+        window: Any = None,
+        burst_threshold: int = 10,
+        burst_window: Any = None,
+        cooldown: Any = None,
+        session_lifetime_max: int | None = 500,
+    ) -> None:
+        bundle = require_tessera_rs()
+        if not bundle.ratelimit_available:
+            from tessera.ratelimit import ToolCallRateLimit as PyToolCallRateLimit
+
+            self._fallback = PyToolCallRateLimit(
+                max_calls=max_calls,
+                window=window,
+                burst_threshold=burst_threshold,
+                burst_window=burst_window,
+                cooldown=cooldown,
+                session_lifetime_max=session_lifetime_max,
+            )
+            self._inner: Any = None
+            logger.info(
+                "RustToolCallRateLimitAdapter: tessera-rs<0.11.0 has no "
+                "ratelimit submodule; falling back to Python implementation"
+            )
+            return
+
+        def _to_seconds(value: Any, default: float) -> float:
+            if value is None:
+                return default
+            if hasattr(value, "total_seconds"):
+                return float(value.total_seconds())
+            return float(value)
+
+        self._fallback = None
+        self._inner = bundle.ratelimit.ToolCallRateLimit(
+            max_calls=int(max_calls),
+            window_seconds=_to_seconds(window, 300.0),
+            burst_threshold=int(burst_threshold),
+            burst_window_seconds=_to_seconds(burst_window, 5.0),
+            cooldown_seconds=_to_seconds(cooldown, 30.0),
+            session_lifetime_max=session_lifetime_max,
+        )
+
+    def check(
+        self,
+        session_id: str,
+        tool_name: str = "",
+        at: Any = None,
+    ) -> tuple[bool, str | None]:
+        # The Rust binding uses the system clock; the `at` override
+        # is Python-only (used for tests). When `at` is supplied,
+        # delegate to the Python fallback so the test contract holds.
+        if at is not None:
+            if self._fallback is None:
+                from tessera.ratelimit import ToolCallRateLimit as PyToolCallRateLimit
+
+                # Construct a Python instance with the same shape so
+                # the override path stays correct (tests do not care
+                # about the Rust speedup).
+                self._fallback = PyToolCallRateLimit()
+            return self._fallback.check(session_id, tool_name, at=at)
+        if self._fallback is not None:
+            return self._fallback.check(session_id, tool_name)
+        return self._inner.check(session_id, tool_name)
+
+    def allow(self, session_id: str, tool_name: str = "") -> bool:
+        if self._fallback is not None:
+            return bool(self._fallback.allow(session_id, tool_name))
+        return bool(self._inner.allow(session_id, tool_name))
+
+    def status(self, session_id: str, at: Any = None) -> Any:
+        if at is not None and self._fallback is not None:
+            return self._fallback.status(session_id, at=at)
+        if self._fallback is not None:
+            return self._fallback.status(session_id)
+        return self._inner.status(session_id)
+
+    def reset(self, session_id: str | None = None) -> None:
+        if self._fallback is not None:
+            self._fallback.reset(session_id)
+            return
+        self._inner.reset(session_id)
+
+
 __all__ = [
     "TESSERA_RS_AVAILABLE",
     "require_tessera_rs",
@@ -651,6 +766,7 @@ __all__ = [
     "RustSsrfGuardAdapter",
     "RustUrlRulesEngineAdapter",
     "RustCelPolicyEngineAdapter",
+    "RustToolCallRateLimitAdapter",
     "rust_canonical_json",
     "rust_injection_score",
     "rust_scan_unicode_tags",

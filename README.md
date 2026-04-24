@@ -13,10 +13,13 @@ SSRF/URL gating, without changing your agent code.
 Built on [Tessera](https://github.com/kenithphilip/Tessera) v0.7.x
 (composable primitives library), with support for SPIRE identity,
 agentgateway data plane, and OpenTelemetry observability. The hot-path
-primitives (policy evaluation, scanners, audit chain, canonical JSON)
-are also available as the
-[`tessera-rs`](https://pypi.org/project/tessera-rs/) PyO3 wheel for
-adapter authors who want the Rust fast path without leaving Python.
+primitives (policy evaluation, scanners, audit chain, canonical JSON,
+rate limiter, SSRF guard, URL rules, CEL evaluator, plus a
+PyScanner callback registry for ML scanners) are also available as
+the [`tessera-rs`](https://pypi.org/project/tessera-rs/) PyO3 wheel
+for adapter authors who want the Rust fast path without leaving
+Python. As of `agentmesh-mesh` v0.9.0, the `MeshProxy(use_rust_primitives=True)`
+flag auto-swaps the rate limiter, SSRF guard, and audit sink.
 
 ## Quickstart
 
@@ -26,8 +29,7 @@ pip install agentmesh-mesh tessera-mesh
 
 # Optional: drop in the Rust fast-path for hot primitives
 # (compatible with the Python tessera-mesh package, no API changes)
-pip install tessera-rs            # latest stable, 0.8.0
-pip install tessera-rs==0.9.0a1   # prerelease with OTel-native spans
+pip install tessera-rs            # latest stable, 0.11.0
 
 # Start the demo tools server
 python examples/demo_tools_server.py &
@@ -46,11 +48,19 @@ python examples/demo_agent.py
 
 > **Tessera Rust fast-path.** The optional `tessera-rs` wheel exposes
 > Rust implementations of `Policy.evaluate`, the heuristic and unicode
-> scanners, the hash-chained audit sink, and canonical JSON. The
-> Python `tessera-mesh` API stays the same; AgentMesh adapters can
-> swap in the Rust implementations where it matters. See
+> scanners, the hash-chained audit sink, canonical JSON, the rate
+> limiter, the SSRF guard, the URL rules engine, and the CEL deny
+> evaluator (interpreter + optional Cranelift JIT). The PyScanner
+> registry covers hard scanners (PromptGuard, Perplexity, PDFInspector,
+> ImageInspector, CodeShield) via Python callbacks. The Python
+> `tessera-mesh` API stays the same; AgentMesh adapters can swap
+> in the Rust implementations where it matters. Pass
+> `use_rust_primitives=True` to `MeshProxy` to auto-swap the audit
+> sink, rate limiter, and SSRF guard. See
+> [docs/RUST_PRIMITIVES.md](docs/RUST_PRIMITIVES.md) for the full
+> surface map and
 > [Tessera's MIGRATION.md](https://github.com/kenithphilip/Tessera/blob/main/rust/crates/tessera-py/MIGRATION.md)
-> for the import map.
+> for the per-class import map.
 
 ## Demo output
 

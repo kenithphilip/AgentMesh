@@ -322,7 +322,7 @@ class MeshProxy:
 
         Returns True when:
         1. ``self.use_rust_primitives`` is True
-        2. ``tessera-rs`` (>=0.10.0a1) is importable
+        2. ``tessera-rs`` (>=0.10.0) is importable
         3. ``surface`` is in the curated swap list
 
         Logs once at INFO when the swap activates so operators can
@@ -343,8 +343,18 @@ class MeshProxy:
             self.use_rust_primitives = False  # one-shot warning
             return False
         # Surfaces currently shipped with adapters. Extend as more
-        # adapters land in agentmesh.adapters.tessera_rs.
-        return surface in {"audit", "policy", "context", "ssrf", "url_rules", "cel", "scanners"}
+        # adapters land in agentmesh.adapters.tessera_rs. Each surface
+        # name maps to one or more swap sites in __post_init__.
+        return surface in {
+            "audit",
+            "ratelimit",
+            "ssrf",
+            "url_rules",
+            "policy",
+            "context",
+            "cel",
+            "scanners",
+        }
 
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
@@ -361,10 +371,11 @@ class MeshProxy:
             if TESSERA_RS_AVAILABLE:
                 log.info(
                     "use_rust_primitives=True: tessera-rs adapters available "
-                    "for audit, scanners, ssrf, url_rules, cel, policy, context. "
-                    "Currently auto-swapped: audit. See "
-                    "docs/RUST_PRIMITIVES.md for the full list and how to "
-                    "wire the rest into your code path."
+                    "for audit, ratelimit, ssrf, url_rules, scanners, cel, "
+                    "policy, context. Auto-swapped on this proxy: audit, "
+                    "ratelimit, ssrf, url_rules. See docs/RUST_PRIMITIVES.md "
+                    "for the full surface map and how to wire policy / "
+                    "context / cel / scanners into your code path."
                 )
             else:
                 log.warning(
@@ -394,15 +405,25 @@ class MeshProxy:
                 pass
 
         # 3. Initialize rate limiter
-        from tessera.ratelimit import ToolCallRateLimit
         from datetime import timedelta
-        self._rate_limiter = ToolCallRateLimit(
-            max_calls=self.rate_limit_calls,
-            burst_threshold=self.rate_limit_burst,
-            burst_window=timedelta(seconds=5),
-            cooldown=timedelta(seconds=30),
-            session_lifetime_max=500,
-        )
+        if self._rust_primitives_active("ratelimit"):
+            from agentmesh.adapters.tessera_rs import RustToolCallRateLimitAdapter
+            self._rate_limiter = RustToolCallRateLimitAdapter(
+                max_calls=self.rate_limit_calls,
+                burst_threshold=self.rate_limit_burst,
+                burst_window=timedelta(seconds=5),
+                cooldown=timedelta(seconds=30),
+                session_lifetime_max=500,
+            )
+        else:
+            from tessera.ratelimit import ToolCallRateLimit
+            self._rate_limiter = ToolCallRateLimit(
+                max_calls=self.rate_limit_calls,
+                burst_threshold=self.rate_limit_burst,
+                burst_window=timedelta(seconds=5),
+                cooldown=timedelta(seconds=30),
+                session_lifetime_max=500,
+            )
 
         # 4. Initialize MCP server allowlist
         if self.mcp_allowlist_patterns:
@@ -594,11 +615,18 @@ class MeshProxy:
         # site. Uses the default socket-based resolver so hostnames are
         # resolved before the CIDR check, which is the only way to catch
         # DNS-rebinding-style payloads.
-        from tessera.ssrf_guard import SSRFGuard
-        self._ssrf_guard = SSRFGuard(
-            blocked_hostnames=self.ssrf_blocked_hostnames,
-            allowlist_hostnames=self.ssrf_allowlist_hostnames,
-        )
+        if self._rust_primitives_active("ssrf"):
+            from agentmesh.adapters.tessera_rs import RustSsrfGuardAdapter
+            self._ssrf_guard = RustSsrfGuardAdapter(
+                blocked_hostnames=self.ssrf_blocked_hostnames,
+                allowlist_hostnames=self.ssrf_allowlist_hostnames,
+            )
+        else:
+            from tessera.ssrf_guard import SSRFGuard
+            self._ssrf_guard = SSRFGuard(
+                blocked_hostnames=self.ssrf_blocked_hostnames,
+                allowlist_hostnames=self.ssrf_allowlist_hostnames,
+            )
 
         # 26. Static URL rules engine. Always instantiated so the
         # endpoint is callable; only consulted in evaluate_tool_call

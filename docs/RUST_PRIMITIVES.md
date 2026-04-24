@@ -33,13 +33,58 @@ affected.
 |---------|--------------|--------------|--------|
 | `tessera.policy.Policy` | `Policy` | `agentmesh.adapters.tessera_rs.RustPolicyAdapter` | Available, used via direct construction |
 | `tessera.context.Context` | `Context` | `agentmesh.adapters.tessera_rs.RustContextAdapter` | Available, used via direct construction |
+| `tessera.ratelimit.ToolCallRateLimit` | `ToolCallRateLimit` | `agentmesh.adapters.tessera_rs.RustToolCallRateLimitAdapter` | **Auto-swapped** when `use_rust_primitives=True` |
 | `tessera.audit_log.JSONLHashchainSink` | `JSONLHashchainSink` | `agentmesh.adapters.tessera_rs.RustJsonlHashchainSinkAdapter` | **Auto-swapped** when `use_rust_primitives=True` and `audit_log_path` is set |
+| `tessera.ssrf_guard.SSRFGuard` | `SSRFGuard` | `agentmesh.adapters.tessera_rs.RustSsrfGuardAdapter` | **Auto-swapped** when `use_rust_primitives=True`; falls back to Python on custom hostname lists |
+| `tessera.url_rules.URLRulesEngine` | `URLRulesEngine` | `agentmesh.adapters.tessera_rs.RustUrlRulesEngineAdapter` | Available, falls back to Python for non-prefix patterns |
 | `tessera.scanners.heuristic.injection_score` | `injection_score` | `agentmesh.adapters.tessera_rs.rust_injection_score` | Available, used via direct call |
 | `tessera.scanners.unicode.scan_unicode_tags` | `scan_unicode_tags` | `agentmesh.adapters.tessera_rs.rust_scan_unicode_tags` | Available, used via direct call |
-| `tessera.ssrf_guard.SSRFGuard` | `SSRFGuard` | `agentmesh.adapters.tessera_rs.RustSsrfGuardAdapter` | Available, falls back to Python on custom hostname lists |
-| `tessera.url_rules.URLRulesEngine` | `URLRulesEngine` | `agentmesh.adapters.tessera_rs.RustUrlRulesEngineAdapter` | Available, falls back to Python for non-prefix patterns |
 | `tessera.cel_engine.CELPolicyEngine` | `CELPolicyEngine` | `agentmesh.adapters.tessera_rs.RustCelPolicyEngineAdapter` | Available, used via `RustPolicyAdapter.set_cel_engine` |
 | Canonical JSON serializer | (Python `json.dumps`) | `agentmesh.adapters.tessera_rs.rust_canonical_json` | Available, used via direct call |
+| Hard scanners (PromptGuard, Perplexity, PDF, Image, CodeShield) | varies | `tessera_rs.scanners.register_scanner` + `scan` | **Hybrid**: register a Python implementation under a name, invoke from any consumer through the registry. See [PyScanner registry](#pyscanner-callback-registry) below. |
+
+## What auto-swaps when `use_rust_primitives=True`
+
+As of `agentmesh-mesh` v0.9.0:
+
+- `_audit_sink` (when `audit_log_path` is set)
+- `_rate_limiter` (always)
+- `_ssrf_guard` (always; falls back to Python if custom hostname lists are configured)
+
+The other adapters (Policy, Context, scanners, URL rules, CEL,
+canonical JSON) require explicit construction in your application
+code today; the proxy still uses the Python implementations for
+those at the construction sites in `__post_init__`. Wider auto-swap
+coverage is tracked for v0.10.0 of `agentmesh-mesh`.
+
+## PyScanner callback registry
+
+The "hard" scanners (PromptGuard, Perplexity, PDFInspector,
+ImageInspector, CodeShield) are not pure-Rust ports because they
+depend on Python ML / PIL / sandboxed-PDF stacks. Instead,
+`tessera-rs` ships a callback registry: register a Python callable
+under a stable name, then any consumer (the Rust gateway, AgentMesh,
+another Python module) invokes it through the same dispatcher.
+
+```python
+from tessera_rs.scanners import register_scanner, scan
+
+def my_promptguard(text: str) -> dict:
+    return {
+        "detected": expensive_ml_call(text) > 0.5,
+        "score": 0.42,
+        "reason": "promptguard ML",
+    }
+
+register_scanner("promptguard", my_promptguard)
+result = scan("promptguard", "Ignore previous instructions...")
+```
+
+The registry survives across the PyO3 boundary, so a single
+registration in your AgentMesh process is visible to everyone in
+the same Python interpreter. Future Rust-side consumers (e.g. the
+gateway invoking registered scanners during request processing)
+will dispatch through the same registry.
 
 ## Manual wiring (beyond the auto-swap)
 
@@ -80,7 +125,6 @@ Many AgentMesh primitives have no Rust equivalent today. The flag
 does NOT change behavior for these; the Python `tessera` package
 keeps running for them:
 
-- `tessera.ratelimit.ToolCallRateLimit` (sliding-window state)
 - `tessera.guardrail.LLMGuardrail` (LLM call + circuit breaker)
 - `tessera.scanners.pii.PIIScanner` (Presidio-backed)
 - `tessera.scanners.directive`, `tessera.scanners.intent`,
@@ -118,8 +162,16 @@ where they are available. Microbench numbers from
 - CEL evaluator (Cranelift JIT, int rules): ~40 ns per rule
   (around 80x faster than the interpreter)
 - SIMD JSON body parse: 4-8% faster than serde_json on 4-64KB bodies
+- Rate limiter: identical wire behavior to Python; the Rust
+  implementation pays no per-check allocation for the in-window
+  vec, so it is roughly 5-10x faster per `check()` call at scale
+  (not yet bench-quantified)
 - EmbeddingAnomalyChecker baseline computation: trivial pure-Rust
   port; not a bottleneck either way
+
+Macro-level bench compare runs (`rust/scripts/bench-compare.sh`
+in the Tessera repo) capture full Rust-gateway-vs-AgentMesh
+numbers across mixed and single-endpoint workloads.
 
 ## Verification
 

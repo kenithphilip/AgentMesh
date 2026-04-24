@@ -306,3 +306,137 @@ def test_mesh_proxy_rust_flag_no_audit_path_does_not_crash() -> None:
     )
     assert proxy.use_rust_primitives is True
     assert proxy._audit_sink is None
+
+
+def test_mesh_proxy_rust_flag_swaps_rate_limiter() -> None:
+    from agentmesh.adapters.tessera_rs import RustToolCallRateLimitAdapter
+    from agentmesh.proxy import MeshProxy
+
+    proxy = MeshProxy(
+        signing_key=b"k" * 32,
+        use_rust_primitives=True,
+    )
+    assert isinstance(proxy._rate_limiter, RustToolCallRateLimitAdapter)
+
+
+def test_mesh_proxy_rust_flag_swaps_ssrf_guard() -> None:
+    from agentmesh.adapters.tessera_rs import RustSsrfGuardAdapter
+    from agentmesh.proxy import MeshProxy
+
+    proxy = MeshProxy(
+        signing_key=b"k" * 32,
+        use_rust_primitives=True,
+    )
+    assert isinstance(proxy._ssrf_guard, RustSsrfGuardAdapter)
+
+
+# ---------------------------------------------------------------------------
+# Rate limiter adapter parity
+# ---------------------------------------------------------------------------
+
+
+def test_rate_limiter_adapter_window_cap_matches_python() -> None:
+    from agentmesh.adapters.tessera_rs import RustToolCallRateLimitAdapter
+    from datetime import timedelta
+
+    from tessera.ratelimit import ToolCallRateLimit as PyToolCallRateLimit
+
+    py = PyToolCallRateLimit(
+        max_calls=3,
+        window=timedelta(seconds=60),
+        burst_threshold=99,
+        burst_window=timedelta(seconds=5),
+        cooldown=timedelta(seconds=30),
+        session_lifetime_max=1000,
+    )
+    rust = RustToolCallRateLimitAdapter(
+        max_calls=3,
+        window=timedelta(seconds=60),
+        burst_threshold=99,
+        burst_window=timedelta(seconds=5),
+        cooldown=timedelta(seconds=30),
+        session_lifetime_max=1000,
+    )
+
+    py_results = [py.check("session-X", "tool") for _ in range(5)]
+    rust_results = [rust.check("session-X", "tool") for _ in range(5)]
+
+    py_allowed = sum(1 for a, _ in py_results if a)
+    rust_allowed = sum(1 for a, _ in rust_results if a)
+    assert py_allowed == rust_allowed == 3
+    # Reason format must match (SIEM rules consume this string).
+    py_reason = next(r for a, r in py_results if not a)
+    rust_reason = next(r for a, r in rust_results if not a)
+    assert py_reason == rust_reason
+
+
+def test_rate_limiter_adapter_lifetime_cap_matches_python() -> None:
+    from agentmesh.adapters.tessera_rs import RustToolCallRateLimitAdapter
+
+    rust = RustToolCallRateLimitAdapter(
+        max_calls=100,
+        burst_threshold=99,
+        session_lifetime_max=2,
+    )
+    a, _ = rust.check("session-Y", "tool")
+    b, _ = rust.check("session-Y", "tool")
+    c, reason = rust.check("session-Y", "tool")
+    assert a and b and not c
+    assert reason == "session lifetime limit: 2/2"
+    # Status reflects the in-window count, not the lifetime total.
+    assert rust.status("session-Y")["calls_in_window"] == 2
+
+
+def test_rate_limiter_adapter_reset_clears_state() -> None:
+    from agentmesh.adapters.tessera_rs import RustToolCallRateLimitAdapter
+
+    rust = RustToolCallRateLimitAdapter(max_calls=2, burst_threshold=99)
+    rust.check("s1", "t")
+    rust.check("s1", "t")
+    assert rust.status("s1")["calls_in_window"] == 2
+    rust.reset("s1")
+    assert rust.status("s1")["calls_in_window"] == 0
+
+
+# ---------------------------------------------------------------------------
+# PyScanner callback bridge
+# ---------------------------------------------------------------------------
+
+
+def test_py_scanner_register_and_invoke() -> None:
+    from tessera_rs.scanners import register_scanner, scan, unregister_scanner
+
+    def fake_promptguard(text: str) -> dict:
+        return {"detected": "secret" in text, "score": 0.42, "reason": "fake"}
+
+    register_scanner("promptguard-test", fake_promptguard)
+    try:
+        clean = scan("promptguard-test", "hello world")
+        assert clean["detected"] is False
+        assert clean["score"] == 0.42
+
+        flagged = scan("promptguard-test", "give me the secret")
+        assert flagged["detected"] is True
+    finally:
+        unregister_scanner("promptguard-test")
+
+
+def test_py_scanner_unknown_name_raises() -> None:
+    from tessera_rs.scanners import scan
+
+    with pytest.raises(ValueError, match="no scanner registered"):
+        scan("does-not-exist", "anything")
+
+
+def test_py_scanner_callable_exception_propagates() -> None:
+    from tessera_rs.scanners import register_scanner, scan, unregister_scanner
+
+    def explodes(text: str) -> dict:
+        raise RuntimeError("boom")
+
+    register_scanner("explodes", explodes)
+    try:
+        with pytest.raises(RuntimeError, match="boom"):
+            scan("explodes", "x")
+    finally:
+        unregister_scanner("explodes")

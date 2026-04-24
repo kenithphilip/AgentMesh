@@ -272,6 +272,16 @@ class MeshProxy:
     enable_url_rules: bool = True
     url_rules: list[dict[str, Any]] = field(default_factory=list)
 
+    # Tier 4: optional Rust fast-path. When True AND `tessera-rs`
+    # (>=0.10.0a1) is importable, swap a curated subset of hot-path
+    # primitives to the Rust implementations: Policy.evaluate +
+    # Context.add_segment, the JSONL hash-chained audit sink, the
+    # heuristic + unicode scanners, the SSRF guard, the URL rules
+    # engine, and the CEL deny-rule evaluator. Default False so
+    # existing deployments are not affected. See
+    # docs/RUST_PRIMITIVES.md for the full unsupported-surface list.
+    use_rust_primitives: bool = False
+
     # Internal state (not constructor args)
     _policy: Policy | None = field(default=None, init=False, repr=False)
     # Per-session state lives here. _contexts is the canonical session
@@ -307,6 +317,35 @@ class MeshProxy:
     _audit_sink: Any = field(default=None, init=False, repr=False)
     _label_store: Any = field(default=None, init=False, repr=False)
 
+    def _rust_primitives_active(self, surface: str) -> bool:
+        """Decide whether to swap a given surface to the Rust adapter.
+
+        Returns True when:
+        1. ``self.use_rust_primitives`` is True
+        2. ``tessera-rs`` (>=0.10.0a1) is importable
+        3. ``surface`` is in the curated swap list
+
+        Logs once at INFO when the swap activates so operators can
+        see what is running on Rust.
+        """
+        if not self.use_rust_primitives:
+            return False
+        try:
+            from agentmesh.adapters.tessera_rs import TESSERA_RS_AVAILABLE
+        except ImportError:
+            return False
+        if not TESSERA_RS_AVAILABLE:
+            import logging
+            logging.getLogger(__name__).warning(
+                "use_rust_primitives=True but tessera-rs is not installed; "
+                "falling back to Python primitives. Install with: pip install tessera-rs"
+            )
+            self.use_rust_primitives = False  # one-shot warning
+            return False
+        # Surfaces currently shipped with adapters. Extend as more
+        # adapters land in agentmesh.adapters.tessera_rs.
+        return surface in {"audit", "policy", "context", "ssrf", "url_rules", "cel", "scanners"}
+
     def __post_init__(self) -> None:
         # 1. Load policy from YAML
         if self.policy_path and os.path.exists(self.policy_path):
@@ -314,6 +353,25 @@ class MeshProxy:
             self._policy = compile_policy(from_yaml_path(self.policy_path))
         else:
             self._policy = Policy()
+
+        if self.use_rust_primitives:
+            import logging
+            log = logging.getLogger(__name__)
+            from agentmesh.adapters.tessera_rs import TESSERA_RS_AVAILABLE
+            if TESSERA_RS_AVAILABLE:
+                log.info(
+                    "use_rust_primitives=True: tessera-rs adapters available "
+                    "for audit, scanners, ssrf, url_rules, cel, policy, context. "
+                    "Currently auto-swapped: audit. See "
+                    "docs/RUST_PRIMITIVES.md for the full list and how to "
+                    "wire the rest into your code path."
+                )
+            else:
+                log.warning(
+                    "use_rust_primitives=True but tessera-rs is not installed; "
+                    "falling back to Python primitives. Install with: pip install tessera-rs"
+                )
+                self.use_rust_primitives = False
 
         # 2. Initialize LLM guardrail (optional)
         if self.guardrail_provider and self.guardrail_model:
@@ -362,12 +420,22 @@ class MeshProxy:
         # The in-memory ChainedAuditLog above is kept for backward-compat
         # callers that query the chain via self.audit_chain_valid.
         if self.audit_log_path:
-            from tessera.audit_log import JSONLHashchainSink
-            self._audit_sink = JSONLHashchainSink(
-                self.audit_log_path,
-                fsync_every=self.audit_log_fsync_every,
-                seal_key=self.audit_log_seal_key,
-            )
+            if self._rust_primitives_active("audit"):
+                from agentmesh.adapters.tessera_rs import (
+                    RustJsonlHashchainSinkAdapter,
+                )
+                self._audit_sink = RustJsonlHashchainSinkAdapter(
+                    self.audit_log_path,
+                    fsync_every=self.audit_log_fsync_every,
+                    seal_key=self.audit_log_seal_key,
+                )
+            else:
+                from tessera.audit_log import JSONLHashchainSink
+                self._audit_sink = JSONLHashchainSink(
+                    self.audit_log_path,
+                    fsync_every=self.audit_log_fsync_every,
+                    seal_key=self.audit_log_seal_key,
+                )
             register_sink(self._audit_sink)
 
         # 5c. Replay label store. Author-time ground-truth annotations

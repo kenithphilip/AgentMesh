@@ -13,5 +13,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - run: pip install -e '.[dev]' tessera-mesh[agentmesh,cel,sessions]
+      # tessera-mesh on PyPI is stuck at 0.6.0 pending Trusted
+      # Publishing setup; install Tessera v1.0.2 from git first so
+      # the agentmesh-mesh editable install (pinned to
+      # tessera-mesh>=1.0.0) finds it without going to PyPI.
+      - run: pip install 'tessera-mesh[agentmesh,cel,sessions] @ git+https://github.com/kenithphilip/Tessera.git@v1.0.2'
+      - run: pip install -e '.[dev]'
       - run: pytest tests/ -v --tb=short

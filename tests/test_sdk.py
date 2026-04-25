@@ -38,7 +38,7 @@ class TestMeshClient:
         client, _ = self._make_client()
         h = client.health()
         assert h["status"] == "ok"
-        assert h["version"] == "0.7.1"
+        assert h["version"] == "0.10.0"
         client.close()
 
     def test_add_prompt_and_context(self) -> None:

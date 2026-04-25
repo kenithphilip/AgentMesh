@@ -440,3 +440,114 @@ def test_py_scanner_callable_exception_propagates() -> None:
             scan("explodes", "x")
     finally:
         unregister_scanner("explodes")
+
+
+# ---------------------------------------------------------------------------
+# Provenance label adapter (v1.0 wave 4B)
+# ---------------------------------------------------------------------------
+
+
+def _label_v1_available() -> bool:
+    try:
+        from tessera_rs import label  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+@pytest.mark.skipif(
+    not _label_v1_available(),
+    reason="tessera-rs<1.0.0 has no label submodule",
+)
+def test_label_adapter_trusted_user_matches_python() -> None:
+    """Rust trusted_user lattice numbers match the Python class."""
+    from agentmesh.adapters.tessera_rs import RustProvenanceLabelAdapter
+    from tessera.taint.label import ProvenanceLabel as PyLabel
+
+    rust = RustProvenanceLabelAdapter.trusted_user("alice")
+    py = PyLabel.trusted_user("alice")
+
+    assert rust.integrity_numeric == int(py.integrity)
+    assert rust.secrecy_numeric == int(py.secrecy)
+    assert rust.capacity_numeric == int(py.capacity)
+
+
+@pytest.mark.skipif(
+    not _label_v1_available(),
+    reason="tessera-rs<1.0.0 has no label submodule",
+)
+def test_label_adapter_join_yields_max_integrity() -> None:
+    """Joining a trusted-user label with an untrusted-tool-output
+    label takes integrity to UNTRUSTED (2). Mirrors the Python
+    lattice law in tests/invariants/test_label_lattice.py."""
+    from agentmesh.adapters.tessera_rs import RustProvenanceLabelAdapter
+
+    user = RustProvenanceLabelAdapter.trusted_user("alice")
+    tool = RustProvenanceLabelAdapter.untrusted_tool_output(
+        "seg-1", "https://example.com/api"
+    )
+
+    assert user.integrity_numeric == 0  # TRUSTED
+    assert tool.integrity_numeric == 2  # UNTRUSTED
+
+    joined = user.join(tool)
+    assert joined.integrity_numeric == 2  # max(0, 2) = UNTRUSTED
+
+
+@pytest.mark.skipif(
+    not _label_v1_available(),
+    reason="tessera-rs<1.0.0 has no label submodule",
+)
+def test_label_adapter_canonical_json_carries_both_sources() -> None:
+    """The Rust canonical-JSON encoder includes every joined source."""
+    from agentmesh.adapters.tessera_rs import RustProvenanceLabelAdapter
+
+    user = RustProvenanceLabelAdapter.trusted_user("alice")
+    tool = RustProvenanceLabelAdapter.untrusted_tool_output(
+        "seg-1", "https://example.com/api"
+    )
+
+    encoded = user.join(tool).to_canonical_json()
+    parsed = json.loads(encoded)
+    seg_ids = {s["segment_id"] for s in parsed["sources"]}
+    assert seg_ids == {"seg-1", "user:alice"}
+
+
+@pytest.mark.skipif(
+    not _label_v1_available(),
+    reason="tessera-rs<1.0.0 has no label submodule",
+)
+def test_label_adapter_non_default_secrecy_uses_python_fallback() -> None:
+    """Asking for SecrecyLevel.PRIVATE forces the Python fallback
+    because the Rust binding does not yet take a secrecy arg.
+    Both-Python joins still work via the lattice law."""
+    from agentmesh.adapters.tessera_rs import RustProvenanceLabelAdapter
+
+    a = RustProvenanceLabelAdapter.untrusted_tool_output("s1", "https://x", secrecy=1)
+    b = RustProvenanceLabelAdapter.untrusted_tool_output("s2", "https://y", secrecy=2)
+
+    assert a.secrecy_numeric == 1
+    assert b.secrecy_numeric == 2
+
+    joined = a.join(b)
+    assert joined.secrecy_numeric == 2  # max wins
+    assert joined.integrity_numeric == 2  # both UNTRUSTED
+
+
+@pytest.mark.skipif(
+    not _label_v1_available(),
+    reason="tessera-rs<1.0.0 has no label submodule",
+)
+def test_label_adapter_mixed_backend_join_raises() -> None:
+    """Joining a Rust-backed label with a Python-fallback label is
+    not supported (canonical-JSON shapes differ); the adapter
+    raises rather than silently mixing."""
+    from agentmesh.adapters.tessera_rs import RustProvenanceLabelAdapter
+
+    rust_user = RustProvenanceLabelAdapter.trusted_user("alice")
+    py_tool = RustProvenanceLabelAdapter.untrusted_tool_output(
+        "s", "https://x", secrecy=1
+    )
+
+    with pytest.raises(TypeError, match="share a backend"):
+        rust_user.join(py_tool)

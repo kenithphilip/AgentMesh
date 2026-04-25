@@ -1537,7 +1537,7 @@ class MeshProxy:
         from fastapi import FastAPI, Header
         from typing import Optional
 
-        app = FastAPI(title="AgentMesh Proxy", version="0.3.0")
+        app = FastAPI(title="AgentMesh Proxy", version="0.10.0")
         proxy = self
 
         @app.get("/healthz")
@@ -1546,7 +1546,7 @@ class MeshProxy:
             return {
                 "status": "ok",
                 "service": "agentmesh-proxy",
-                "version": "0.7.1",
+                "version": "0.10.0",
                 # Default session is shown for backward compat; for the
                 # full picture across tenants, see /v1/sessions.
                 "context_segments": len(default_ctx.segments),

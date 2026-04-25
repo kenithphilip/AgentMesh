@@ -356,7 +356,7 @@ class TestHealthFeatures:
         data = r.json()
         assert data["trust_decay"] is True
         assert data["canary_tokens"] is True
-        assert data["version"] == "0.7.1"
+        assert data["version"] == "0.10.0"
 
 
 # ---------------------------------------------------------------------------

@@ -17,6 +17,9 @@ Adapters provided:
   ``tessera.url_rules.URLRulesEngine``
 - :class:`RustCelPolicyEngineAdapter` for
   ``tessera.cel_engine.CELPolicyEngine``
+- :class:`RustProvenanceLabelAdapter` for
+  ``tessera.taint.label.ProvenanceLabel`` (v1.0 wave 4B; requires
+  ``tessera-rs>=1.0.0``)
 - :func:`rust_canonical_json` for
   ``tessera.audit_log.canonical_json``
 - :func:`rust_injection_score` for
@@ -53,6 +56,10 @@ class _TesseraRsBundle:
     ``ratelimit`` is loaded lazily so older ``tessera-rs`` wheels
     (<0.11.0) without the rate limiter still pass the version check.
     Read via :attr:`ratelimit_available` before using.
+
+    ``label`` is loaded lazily so older ``tessera-rs`` wheels
+    (<1.0.0) without the v1.0 ProvenanceLabel binding still pass.
+    Read via :attr:`label_available` before using.
     """
 
     def __init__(self) -> None:
@@ -75,6 +82,14 @@ class _TesseraRsBundle:
         except ImportError:
             self.ratelimit = None
             self.ratelimit_available = False
+        try:
+            from tessera_rs import label
+
+            self.label = label
+            self.label_available = True
+        except ImportError:
+            self.label = None
+            self.label_available = False
 
 
 def _try_import_tessera_rs() -> _TesseraRsBundle | None:
@@ -99,7 +114,9 @@ def require_tessera_rs() -> _TesseraRsBundle:
     if _BUNDLE is None:
         raise RuntimeError(
             "tessera-rs is not installed. "
-            "Install with: pip install tessera-rs (>=0.10.0a1)"
+            "Install with: pip install tessera-rs (>=1.0.0 for the "
+            "v1.0 ProvenanceLabel binding; >=0.10.0a1 for the "
+            "older subset)"
         )
     return _BUNDLE
 
@@ -757,6 +774,146 @@ class RustToolCallRateLimitAdapter:
         self._inner.reset(session_id)
 
 
+# ---------------------------------------------------------------------------
+# Provenance label adapter (v1.0 wave 4B)
+# ---------------------------------------------------------------------------
+
+
+class RustProvenanceLabelAdapter:
+    """Drop-in for ``tessera.taint.label.ProvenanceLabel``.
+
+    v1.0 wave 4B: the canonical Rust ``ProvenanceLabel`` is a
+    bit-identical port of the Python class. This adapter exposes
+    the four constructor + lattice surfaces AgentMesh's
+    ``add_user_prompt`` / quarantine paths read.
+
+    Falls back to Python only when the installed ``tessera-rs``
+    wheel predates 1.0.0 (no ``label`` submodule), or when a
+    caller asks for a non-default ``secrecy`` on
+    ``untrusted_tool_output`` (the Rust binding does not yet
+    accept that argument).
+
+    Numeric levels:
+
+    - ``IntegrityLevel``: 0 = TRUSTED, 1 = ENDORSED, 2 = UNTRUSTED.
+    - ``SecrecyLevel``: 0 = PUBLIC, 1 = INTERNAL, 2 = PRIVATE,
+      3 = RESTRICTED.
+    - ``InformationCapacity``: 1 = BOOL, 2 = ENUM, 3 = NUMBER,
+      4 = STRING.
+    """
+
+    def __init__(self, inner: Any, fallback: Any | None = None) -> None:
+        # Public callers should use the factory classmethods. The
+        # constructor is kept low-friction so wrapping a label
+        # returned from ``join`` is one line.
+        self._inner = inner
+        self._fallback = fallback
+
+    # ---- factories ----------------------------------------------------
+
+    @classmethod
+    def trusted_user(cls, principal: str) -> "RustProvenanceLabelAdapter":
+        """Construct a TRUSTED, PUBLIC, STRING label for user input."""
+        bundle = require_tessera_rs()
+        if not bundle.label_available:
+            from tessera.taint.label import ProvenanceLabel as PyLabel
+
+            return cls(inner=None, fallback=PyLabel.trusted_user(principal))
+        return cls(inner=bundle.label.ProvenanceLabel.trusted_user(principal))
+
+    @classmethod
+    def untrusted_tool_output(
+        cls,
+        segment_id: str,
+        origin_uri: str | None = None,
+        secrecy: int | None = None,
+    ) -> "RustProvenanceLabelAdapter":
+        """Construct an UNTRUSTED, PUBLIC, STRING label for tool output.
+
+        ``secrecy`` defaults to PUBLIC on the Rust path. Pass an
+        explicit non-PUBLIC value (1=INTERNAL, 2=PRIVATE, 3=
+        RESTRICTED) to fall back to the Python implementation,
+        which honors the legacy ``SecrecyLevel.INTERNAL`` default.
+        """
+        bundle = require_tessera_rs()
+        if not bundle.label_available or (secrecy is not None and secrecy != 0):
+            from tessera.taint.label import (
+                ProvenanceLabel as PyLabel,
+                SecrecyLevel as PySecrecy,
+            )
+
+            py_secrecy = PySecrecy(secrecy) if secrecy is not None else PySecrecy.INTERNAL
+            return cls(
+                inner=None,
+                fallback=PyLabel.untrusted_tool_output(
+                    segment_id=segment_id,
+                    origin_uri=origin_uri or "",
+                    secrecy=py_secrecy,
+                ),
+            )
+        return cls(
+            inner=bundle.label.ProvenanceLabel.untrusted_tool_output(
+                segment_id, origin_uri
+            )
+        )
+
+    # ---- lattice op ---------------------------------------------------
+
+    def join(self, other: "RustProvenanceLabelAdapter") -> "RustProvenanceLabelAdapter":
+        """Lattice join. Mirrors ``tessera.taint.label.ProvenanceLabel.join``.
+
+        Both operands must share a backend: two Rust-backed labels
+        join via the Rust path, two Python-fallback labels join
+        via the Python path. Mixed-mode joins are not supported
+        (the canonical JSON shapes differ); construct both
+        operands through the same factory + secrecy combination to
+        stay on one path.
+        """
+        if self._fallback is not None and other._fallback is not None:
+            return RustProvenanceLabelAdapter(
+                inner=None, fallback=self._fallback.join(other._fallback)
+            )
+        if self._fallback is None and other._fallback is None:
+            return RustProvenanceLabelAdapter(inner=self._inner.join(other._inner))
+        raise TypeError(
+            "RustProvenanceLabelAdapter.join requires both labels to "
+            "share a backend (both Rust or both Python). Construct "
+            "through the same factory + secrecy combination."
+        )
+
+    # ---- accessors ----------------------------------------------------
+
+    @property
+    def integrity_numeric(self) -> int:
+        if self._fallback is not None:
+            return int(self._fallback.integrity)
+        return int(self._inner.integrity_numeric())
+
+    @property
+    def secrecy_numeric(self) -> int:
+        if self._fallback is not None:
+            return int(self._fallback.secrecy)
+        return int(self._inner.secrecy_numeric())
+
+    @property
+    def capacity_numeric(self) -> int:
+        if self._fallback is not None:
+            return int(self._fallback.capacity)
+        return int(self._inner.capacity_numeric())
+
+    def to_canonical_json(self) -> str:
+        if self._fallback is not None:
+            from tessera.taint.json_encoder import canonical_json
+
+            return canonical_json(self._fallback)
+        return str(self._inner.to_canonical_json())
+
+    def __repr__(self) -> str:
+        if self._fallback is not None:
+            return f"RustProvenanceLabelAdapter(fallback={self._fallback!r})"
+        return f"RustProvenanceLabelAdapter({self._inner!r})"
+
+
 __all__ = [
     "TESSERA_RS_AVAILABLE",
     "require_tessera_rs",
@@ -767,6 +924,7 @@ __all__ = [
     "RustUrlRulesEngineAdapter",
     "RustCelPolicyEngineAdapter",
     "RustToolCallRateLimitAdapter",
+    "RustProvenanceLabelAdapter",
     "rust_canonical_json",
     "rust_injection_score",
     "rust_scan_unicode_tags",

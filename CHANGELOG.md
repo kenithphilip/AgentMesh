@@ -7,6 +7,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Everything before v1.0.0 is experimental; API changes may occur in any
 minor release.
 
+## [0.10.0] - 2026-04-25
+
+Requires `tessera-mesh>=1.0.0` (Tessera GA).
+
+### Added
+
+- **`RustProvenanceLabelAdapter`** in
+  `agentmesh.adapters.tessera_rs` that wraps the v1.0
+  `tessera_rs.label.ProvenanceLabel` PyO3 binding (Wave 4B in the
+  Tessera v0.12-to-v1.0 plan). Ships four surfaces:
+  `trusted_user`, `untrusted_tool_output`, `join`, and
+  `to_canonical_json` plus three numeric accessors
+  (`integrity_numeric`, `secrecy_numeric`, `capacity_numeric`).
+- `_TesseraRsBundle.label` and `_TesseraRsBundle.label_available`
+  flag for AgentMesh callers that want to gate the fast path on
+  the v1.0 wheel being installed.
+- Five parity tests in `tests/test_tessera_rs_adapter.py` covering
+  trusted-user / untrusted-tool-output construction, the
+  max-integrity join law, canonical-JSON source preservation,
+  the Python-fallback path for non-default `secrecy`, and the
+  mixed-backend join rejection.
+
+### Changed
+
+- `tessera-mesh` dependency pin raised to `>=1.0.0` so users get
+  the v1.0 GA library by default. Older `tessera-mesh>=0.7.1`
+  installs still work; `RustProvenanceLabelAdapter` falls back to
+  Python when the `tessera_rs.label` submodule is absent.
+- `agentmesh-proxy` `/healthz` `version` field now reports
+  `0.10.0` (was stuck at `0.7.1` since v0.7.1).
+- FastAPI app `version` raised from `0.3.0` to `0.10.0`.
+
+### Verified
+
+- `pytest tests/test_tessera_rs_adapter.py -v` passes 5 new label
+  tests + the existing parity matrix when `tessera-rs>=1.0.0` is
+  installed; the `label` tests skip cleanly on older wheels.
+- Smoke-tested on `tessera-rs` built from
+  `Tessera/rust/crates/tessera-py` at workspace v1.0.0.
+
+## [0.9.0] - 2026-04-24
+
+Requires `tessera-mesh>=0.7.1`.
+
+### Added
+
+- Deeper `tessera_rs` auto-swap when `use_rust_primitives=True`:
+  rate limiter + `PyScanner` registry now route through the Rust
+  fast path. New `RustToolCallRateLimitAdapter` mirrors the
+  Python `tessera.ratelimit.ToolCallRateLimit` surface, with a
+  Python fallback for `tessera-rs<0.11.0`.
+- `PyScanner` parity tests cover heuristic-injection scoring and
+  the unicode-tag scanner.
+
+## [0.8.0] - 2026-04-23
+
+Requires `tessera-mesh>=0.7.1`.
+
+### Added
+
+- `agentmesh.adapters.tessera_rs` module exposing
+  `RustContextAdapter`, `RustPolicyAdapter`,
+  `RustJsonlHashchainSinkAdapter`, `RustSsrfGuardAdapter`,
+  `RustUrlRulesEngineAdapter`, `RustCelPolicyEngineAdapter` plus
+  helper functions `rust_canonical_json`,
+  `rust_injection_score`, `rust_scan_unicode_tags`. Activated by
+  passing `use_rust_primitives=True` to `MeshProxy`; falls back
+  transparently to Python for surfaces tessera_rs does not yet
+  cover.
+- README and docs note the optional `tessera-rs` PyO3 wheel as
+  the Rust fast path.
+
 ## [0.7.1] - 2026-04-23
 
 Requires `tessera-mesh>=0.7.1`.
